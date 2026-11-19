@@ -162,6 +162,10 @@ non-last dim or > 16 classes, image `print()`/`repr()`.
 - The arena is a fixed region (default 24 MiB of the 64 MiB client arena;
   `TORCH_VC4_ARENA_MB` overrides).  Running out raises
   `torch_vc4: out of arena …` rather than silently spilling.
+- Importing prints torch's one-time "Overriding a previously registered
+  kernel" `UserWarning`.  It refers to the `PrivateUse1` stub/batching
+  kernels that this backend deliberately replaces (`aten::add`,
+  `convolution_overrideable`, `max_pool2d`, …); it is expected, not a bug.
 
 ## Files
 
