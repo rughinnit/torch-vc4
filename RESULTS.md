@@ -144,9 +144,11 @@ make the daemon answer `E_BUSY` and the engine retry for ~60 s.
 
 ## What is not there (and is reported as such)
 
-- `torch.device("vc4")`: the string parser is initialised before the rename,
-  so only `"privateuseone"` parses; `torch_vc4.device()` is the supported
-  entry point.
+- `torch.device("vc4")`: torch's device-string parser is populated during
+  `import torch`, before the rename (it still accepts the built-in spelling
+  `"privateuseone"` and rejects `"vc4"` afterwards; consistent with a static
+  name table, though the C++ source is not shipped in the wheel).
+  `torch_vc4.device()` is the supported entry point.
 - No autograd, no `torch.compile`, no conv/pool/softmax aten ops, no
   broadcasting, no `as_strided` (hence no slicing/reshape/view), no device-side
   dtype conversion, no multi-device, no streams.

@@ -55,11 +55,12 @@ print((y.cpu() - x.cpu() @ x.cpu()).abs().max())
 ### Device string
 
 `torch.utils.rename_privateuse1_backend("vc4")` is applied at import, and
-tensors report `device(type='vc4')`. However torch 2.15's device-string
-*parser* is initialised during `import torch`, before the rename, so
-`torch.device("vc4")` raises `RuntimeError: Invalid device string: 'vc4'`
-(measured; see RESULTS). Use `torch_vc4.device()`, or the built-in spelling
-`torch.device("privateuseone")`; both give a device whose `.type` is `"vc4"`.
+tensors report `device(type='vc4')`. However torch's device-string parser is
+populated during `import torch`, before the rename, so `torch.device("vc4")`
+raises `RuntimeError: Invalid device string: 'vc4'` (measured; the built-in
+spelling `"privateuseone"` still parses, consistent with a static name table).
+Use `torch_vc4.device()`, or `torch.device("privateuseone")`; both give a
+device whose `.type` is `"vc4"`.
 
 ## Op table (this is the whole surface)
 
