@@ -136,13 +136,20 @@ def main():
 
     # ------------------------------------------------- strict failure, no CPU
     expect_raise("torch.sin(vc4) raises", lambda: torch.sin(x))
-    expect_raise("torch.mean(vc4) raises", lambda: torch.mean(x))
+    expect_raise("torch.sum(dim=) raises (no reduction over a dim)",
+                 lambda: torch.sum(x, dim=1))
     expect_raise("broadcasting add raises",
                  lambda: x + torch.empty(256, 1,
                                          device=torch_vc4.device()),
                  needle="identical shapes")
-    expect_raise("slicing a vc4 tensor raises (as_strided missing)",
-                 lambda: x[:, :1], needle="as_strided")
+    # views are metadata-only: a dim-0 slice is contiguous and usable ...
+    check("dim-0 slice is a contiguous view",
+          bool(x[0:2].is_contiguous() and tuple(x[0:2].shape) == (2, 256)),
+          str(tuple(x[0:2].shape)))
+    # ... but a non-contiguous view is rejected by every compute op
+    expect_raise("compute on a non-contiguous view raises",
+                 lambda: torch.add(x.transpose(0, 1), x.transpose(0, 1)),
+                 needle="contiguous")
     expect_raise("float64 on vc4 raises",
                  lambda: torch.empty(4, 4, dtype=torch.float64,
                                      device=torch_vc4.device()),

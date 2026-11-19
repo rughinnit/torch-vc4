@@ -6,8 +6,10 @@ Usage:
     x = torch.randn(256, 256, device=torch_vc4.device())
     y = x @ x
 
-Only a handful of ops exist on the device; anything else raises instead of
-falling back to the CPU (see README.md for the op table).
+A small but usable subset exists on the device: gemm/linear, conv2d, pools,
+softmax, nearest resize, elementwise ops, inference-mode batch norm, views,
+and autograd for the training path (see README.md for the op table and its
+constraints).  Anything else raises instead of falling back to the CPU.
 
 Note on the device string: this backend renames PrivateUse1 to "vc4", and
 tensors report `device('vc4')`, but torch 2.15's device-string *parser* was
@@ -127,16 +129,55 @@ def synchronize() -> None:
     return None
 
 
+# The subset op surface is registered from Python: the native part supplies
+# the engine bindings and the byte-level layout primitives, ops.py the aten
+# forward kernels, autograd.py the torch.autograd.Function graph.  Importing
+# this module therefore installs *all* of it, and any op not listed in
+# SUPPORTED_OPS still hits the catch-all that raises.
+from . import ops as _ops            # noqa: E402
+from . import autograd as _autograd  # noqa: E402
+
+_ops.register()
+_autograd.register()
+
+mse_loss = _autograd.mse_loss
+fold_bn_into_conv = _ops.fold_bn_into_conv
+adaptive_matrix = _ops.adaptive_matrix
+
 SUPPORTED_OPS = (
+    # memory / transfer
     "aten::empty.memory_format",
     "aten::empty_strided",
     "aten::copy_ (and Tensor.to/.cpu for f32, same shape)",
+    "aten::fill_.Scalar, aten::zero_",
+    "aten::normal_ (host RNG, uploaded)",
+    "aten::_local_scalar_dense (Tensor.item, float(t))",
+    # views (metadata; non-contiguous views are rejected by compute ops)
+    "aten::view, aten::flatten, aten::reshape",
+    "aten::as_strided (alias; compute ops need contiguity)",
+    # gemm
     "aten::mm",
-    "aten::matmul (2-D x 2-D only)",
+    "aten::matmul (2-D x 2-D)",
+    "aten::linear (F.linear / nn.Linear; x @ W^T + bias, all on the QPU)",
+    # conv / pool
+    "aten::convolution_overrideable (conv2d: 3x3/1x1, stride 1/2, pad, "
+    "groups=1 and depthwise, batch 1)",
+    "aten::max_pool2d (2x2/2 engine kernel, any NxN/stride/pad generic)",
+    "aten::_adaptive_avg_pool2d (any output size, GEMM reduction)",
+    "aten::upsample_nearest2d (nearest, any scale)",
+    # elementwise / reductions
     "aten::add.Tensor (same shape, alpha=1)",
     "aten::mul.Tensor (same shape)",
-    "aten::relu",
-    "aten::normal_ (host RNG, uploaded)",
+    "aten::sub.Tensor / sub.Scalar",
+    "aten::add.Scalar, mul.Scalar, div.Scalar, neg, pow.Tensor_Scalar(2)",
+    "aten::relu, silu, sigmoid",
+    "aten::_softmax (last dim, <= 16 classes)",
+    "aten::sum (full reduction), aten::mean",
+    "aten::cat (channel axis)",
+    "aten::native_batch_norm / batch_norm (inference mode only)",
+    # autograd
+    "autograd for mm/matmul, linear, add, sub, mul, scalar ops, relu, silu, "
+    "sigmoid, softmax, conv2d, max_pool2d, view/as_strided(contiguous)",
 )
 
 __all__ = [
@@ -146,5 +187,8 @@ __all__ = [
     "reset_stats",
     "arena",
     "synchronize",
+    "mse_loss",
+    "fold_bn_into_conv",
+    "adaptive_matrix",
     "SUPPORTED_OPS",
 ]
