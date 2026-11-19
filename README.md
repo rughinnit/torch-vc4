@@ -95,7 +95,7 @@ engine bindings in `csrc/torch_vc4.cpp`):
 
 | aten op | how implemented | constraints |
 |---|---|---|
-| `empty.memory_format`, `empty_strided` | arena sub-allocator | f32; contiguous strides (unit dims may have any stride) |
+| `empty.memory_format`, `empty_strided` | arena sub-allocator | f32 (plus int64 storage for bookkeeping buffers, e.g. batch-norm counters); contiguous strides, unit dims may have any stride |
 | `copy_` (`.to`, `.cpu`, `.clone`) | `vc4_upload` / `vc4_download` | f32, contiguous |
 | `fill_`, `zero_` | host constant + upload | f32 |
 | `view`, `flatten`, `reshape`, `as_strided` | **metadata alias** (`set_storage`), no copy | compute ops require contiguity; a non-contiguous view is rejected, not silently copied |
@@ -114,7 +114,7 @@ engine bindings in `csrc/torch_vc4.cpp`):
 | `upsample_nearest2d` | host byte gather (PyTorch's nearest index rule) | nearest, any scale; not bilinear |
 | `native_batch_norm`, `batch_norm` | per-channel scale/shift as QPU elementwise ops | **inference mode only**; `fold_bn_into_conv()` folds BN into conv parameters offline |
 | `_local_scalar_dense` | download 1 element | `float(t)`, `t.item()` |
-| `normal_` | host `std::mt19937`, uploaded | f32; the RNG is on the host |
+| `normal_`, `uniform_` | host `std::mt19937`, uploaded | f32; the RNG is on the host (`uniform_` is what module constructors call) |
 | everything else | catch-all `PrivateUse1` fallback | raises `RuntimeError: torch_vc4: 'aten::…' is not implemented for device vc4` |
 
 Autograd (`torch_vc4/autograd.py`, registered at `AutogradPrivateUse1`):

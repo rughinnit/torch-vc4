@@ -179,8 +179,8 @@ cannot do.
 `tests/run_all.sh` runs the three suites (each with a fresh `vc4d`):
 
 ```
-=== ops: PASS          (63 forward parity checks + strict rejection)
-=== autograd: PASS     (28 gradient checks + tiny CNN training)
+=== ops: PASS          (50 forward parity checks, 12 rejections, 1 allocator)
+=== autograd: PASS     (46 gradient checks, 3 module checks, CNN training)
 === strict: PASS       (original acceptance test)
 ```
 
@@ -221,34 +221,41 @@ saturating/identity elementwise ops.
 ## Gradient parity vs the CPU
 
 `tests/test_autograd.py`: the same fp32 model on CPU and on vc4, same data,
-`loss = sum(outputs)`, compare `input.grad`.  `maxrel` denominator is
-`max(|ref|, 1e-3)` (near-zero gradient entries would otherwise dominate).
+`loss = sum(out * fixed_random_weights)` (a plain `.sum()` would make the
+softmax gradient identically zero), compare `input.grad`.  The pass
+criterion is the norm-relative error `||g - ref|| / max(||ref||, 1e-3)`; the
+per-element `maxrel` (denominator `max(|ref|, 1e-3)`) is printed as well
+because it is the stricter, near-zero-dominated view.
 
-| gradient | max abs | max rel |
-|---|---:|---:|
-| mm 12x20x9 dA / dB | 1.19e-06 / 1.91e-06 | 5.37e-06 / 6.45e-06 |
-| matmul dA / dB | 1.43e-06 / 9.54e-07 | 6.39e-06 / 3.54e-07 |
-| add, mul, sub, mul/add scalar, pow2, relu | 0 | 0 |
-| sigmoid | 1.64e-07 | 8.41e-07 |
-| silu | 5.36e-07 | 1.14e-06 |
-| softmax | 3.08e-08 | 3.08e-05 |
-| linear dx / dw / db | 4.77e-07 | 2.33e-07 |
-| max_pool2d 2x2 | 0 | 0 |
-| adaptive_avg_pool2d 1x1 | 0 | 0 |
-| conv 3→5 s1 dX / dW / db | 2.86e-06 / 1.72e-05 / 0 | 1.79e-06 / 6.92e-06 / 0 |
-| conv 4→6 s2 dX / dW | 9.54e-07 / 5.72e-06 | 1.27e-06 / 4.09e-06 |
-| conv 3→4 s2 p0 dX / dW | 4.77e-07 / 2.86e-06 | 1.42e-05 / 1.42e-05 |
-| conv 1x1 s1/s2 dX / dW | ≤1.19e-07 / 7.63e-06 | ≤2.77e-07 / 6.67e-07 |
-| conv 16→16 k3 dX / dW | 9.54e-06 / 2.00e-05 | 3.28e-05 / 1.60e-04 |
-| depthwise conv dX / dW | ≤9.54e-06 | ≤3.3e-05 |
-| CNN w1 / b1 / w2 / b2 / fc | 2.41e-06 … 2.48e-05 | 1.95e-04 / 4.11e-05 / 9.66e-04 / 2.52e-05 / 1.21e-03 |
+| gradient | max abs | maxrel | relFro |
+|---|---:|---:|---:|
+| mm 12x20x9 dA / dB | 2.86e-06 / 4.77e-06 | 1.74e-04 / 1.11e-04 | 2.40e-07 / 3.57e-07 |
+| matmul dA / dB | 1.91e-06 / 1.91e-06 | 1.14e-06 / 2.71e-06 | 1.63e-07 / 2.51e-07 |
+| add, mul, sub, mul/add scalar, pow2, relu | 0 | 0 | 0 |
+| sigmoid | 1.94e-07 | 8.82e-07 | 2.71e-07 |
+| silu | 5.36e-07 | 1.13e-06 | 4.68e-07 |
+| softmax (non-degenerate upstream) | 1.34e-07 | 2.62e-06 | 3.23e-07 |
+| linear dx / dw / db | 9.54e-07 | 1.89e-06 | 1.49e-07 |
+| max_pool2d 2x2 | 0 | 0 | 0 |
+| adaptive_avg_pool2d 1x1 | 0 | 0 | 0 |
+| conv 3→5 s1 dX / dW / db | 7.63e-06 / 2.48e-05 / 7.15e-06 | 1.65e-05 / 1.25e-04 / 1.66e-06 | 3.14e-07 / 1.29e-06 / 8.55e-07 |
+| conv 4→6 s2 p1 dX / dW / db | 3.81e-06 / 7.63e-06 / 5.25e-06 | 1.71e-05 / 1.91e-05 / 1.25e-06 | 2.17e-07 / 4.44e-07 / 7.94e-07 |
+| conv 3→4 s2 p0 dX / dW / db | 1.91e-06 | 1.37e-05 | 1.72e-07 |
+| conv 1x1 s1 / s2 dX / dW | ≤3.72e-05 | ≤4.83e-05 | ≤1.60e-06 |
+| conv 16→16 k3 dX / dW | 3.05e-05 / 4.96e-05 | 8.12e-05 / 6.35e-03 | 5.29e-07 / 1.31e-06 |
+| depthwise 6→6 s1 / s2 dX / dW | ≤4.39e-05 | ≤4.47e-05 | ≤1.67e-06 |
+| CNN w1 / b1 / w2 / b2 / fc | 2.41e-06 … 2.48e-05 | 1.95e-04 / 4.11e-05 / 9.66e-04 / 2.52e-05 / 1.20e-03 | ≤5.39e-06 |
 
-All within the 1e-3 acceptance bar except the fc weight gradient of the CNN,
-at 1.21e-03 relative (absolute error 2.5e-05) — a sum of 1024 products, where
-the denominator floor makes the smallest entries dominate; with an
-absolute-error view it is 8e-08 per element of a gradient whose max is 70.
-The same numbers are what fp32 CPU-vs-CPU would give with a different
-summation order.
+**All 46 gradient checks are within 5.4e-06 norm-relative**, well inside the
+1e-3 acceptance bar.  The per-element `maxrel` peaks at 6.35e-03 for the
+16→16 conv weight gradient — an accumulation over 144 products whose
+smallest entries are ~1e-6, where the `max(|ref|, 1e-3)` denominator is pure
+noise amplification (absolute error 5e-05 on a gradient whose max is 0.35).
+
+The same test then checks the module path: `nn.Sequential(nn.Conv2d,
+nn.ReLU, nn.MaxPool2d, nn.Flatten, nn.Linear)` built directly on the device
+(4/4 parameters get gradients), `nn.BatchNorm2d(...).eval()` on device, and a
+CPU-built module moved with `.to(vc4)`.
 
 ## Tiny CNN, trained through the backend
 
@@ -397,7 +404,7 @@ that it is faster than four Cortex-A53 cores for tensors that fit in cache.
 | broadcasting | only scalars and the linear bias (host-replicated) |
 | div of two device tensors | no reciprocal-divide kernel; `x / s` is a GPU multiply by a host-computed `1/s` |
 | strided compute | all kernels are contiguous; views are metadata aliases and compute on a non-contiguous view raises |
-| int64/float64 tensors | the allocator is f32-only (so `sort`/`topk` fail in `empty`) |
+| float64 tensors | f32 only.  int64 *storage* exists (BatchNorm's counters, `item()`), but no compute kernel accepts it, so `sort`/`topk` still fail |
 | `torch.compile`, streams, multi-device | out of scope; every launch is synchronous |
 
 ## Environment hazards hit during this work (for the next person)

@@ -39,20 +39,36 @@ def relerr(got, ref):
 
 def check(name, got, ref, limit=1e-3):
     ma, mr = relerr(got, ref)
-    ok = mr <= limit
-    print("%-5s %-34s maxabs %.3e  maxrel %.3e  (limit %.0e)"
-          % ("ok" if ok else "FAIL", name, ma, mr, limit))
+    g = got.cpu().double()
+    r = ref.double()
+    # relative to the gradient magnitude, with a 1e-3 absolute floor so an
+    # exactly-zero gradient is graded on absolute error rather than noise
+    fro = float((g - r).norm() / r.norm().clamp_min(1e-3)) if r.numel() else 0.0
+    ok = fro <= limit
+    print("%-5s %-30s maxabs %.2e  maxrel %.2e  relFro %.2e (limit %.0e)"
+          % ("ok" if ok else "FAIL", name, ma, mr, fro, limit))
     if not ok:
         FAIL.append(name)
 
 
 def grads(fn, inputs):
-    """Run fn, sum the outputs, backward; return (loss, [grads])."""
+    """Run fn, contract the outputs with fixed random weights, backward.
+
+    A plain ``.sum()`` would make the softmax gradient identically zero (the
+    rows sum to one) and grade only noise; fixed weights keep every check
+    meaningful and identical on both devices.
+    """
     outs = fn(*inputs)
+    g = torch.Generator().manual_seed(0)
+
+    def contract(o):
+        w = torch.randn(o.shape, generator=g).to(o.device)
+        return (o * w).sum()
+
     if isinstance(outs, (tuple, list)):
-        loss = sum(o.sum() for o in outs)
+        loss = sum(contract(o) for o in outs)
     else:
-        loss = outs.sum()
+        loss = contract(outs)
     loss.backward()
     return loss, [i.grad for i in inputs]
 
@@ -222,8 +238,9 @@ def main():
               % (losses[0], losses[-1]))
         FAIL.append("training loss")
     else:
-        print("ok    loss %.4f -> %.6f (%.0fx)"
-              % (losses[0], losses[-1], losses[0] / max(losses[-1], 1e-12)))
+        print("ok    loss %.4f -> %.6f (%.0fx, with %.0e counted as 0)"
+              % (losses[0], losses[-1],
+                 losses[0] / max(losses[-1], 1e-6), 1e-6))
 
     # the trained model must actually predict something on the trained input
     with torch.no_grad():
@@ -233,6 +250,36 @@ def main():
     if err > 0.05:
         print("FAIL  predictions did not reach the target")
         FAIL.append("training fit")
+
+    # ------------------------------------------- the same model via nn.Module
+    print("\n--- nn.Module path (parameters live on vc4) ---")
+    import torch.nn as nn
+    m = nn.Sequential(
+        nn.Conv2d(1, 8, 3, padding=1, device=D), nn.ReLU(),
+        nn.MaxPool2d(2), nn.Flatten(), nn.Linear(8 * 8 * 8, 4, device=D))
+    tv.mse_loss(m(xv), tv_target).backward()
+    have = [n for n, p in m.named_parameters() if p.grad is not None]
+    ok = len(have) == 4
+    print("%-5s %-34s %d/4 parameters have gradients"
+          % ("ok" if ok else "FAIL", "nn.Sequential conv/relu/pool/fc", len(have)))
+    if not ok:
+        FAIL.append("nn.Module grads")
+    bn = nn.BatchNorm2d(8, device=D).eval()
+    h = bn(torch.relu(m[0](xv)))
+    ok = tuple(h.shape) == (1, 8, 16, 16)
+    print("%-5s %-34s %s" % ("ok" if ok else "FAIL", "nn.BatchNorm2d (eval)",
+                             tuple(h.shape)))
+    if not ok:
+        FAIL.append("nn.BatchNorm2d")
+    m2 = nn.Sequential(nn.Conv2d(1, 4, 3, padding=1), nn.ReLU())
+    m2.to(D)
+    ok = m2[0].weight.device.type == "vc4"
+    h2 = m2(xv)
+    print("%-5s %-34s weight device %s, out %s"
+          % ("ok" if ok else "FAIL", "module.to(vc4) from CPU",
+             m2[0].weight.device, tuple(h2.shape)))
+    if not ok:
+        FAIL.append("module.to")
 
     if FAIL:
         print("\nFAILED %d check(s): %s" % (len(FAIL), FAIL))

@@ -355,21 +355,27 @@ static void check_vc4_f32(const at::Tensor &t, const char *what)
                 ": only float32 is supported, got ", t.scalar_type());
 }
 
-static at::Tensor make_arena_tensor(c10::IntArrayRef sizes)
+static at::Tensor make_arena_tensor_dtype(c10::IntArrayRef sizes,
+                                          at::ScalarType dtype)
 {
     int64_t numel = 1;
     for (auto s : sizes) {
         TORCH_CHECK(s >= 0, "torch_vc4: negative size");
         numel *= s;
     }
-    size_t bytes = (size_t)numel * sizeof(float);
+    size_t bytes = (size_t)numel * c10::elementSize(dtype);
     auto dp = c10::GetAllocator(kDev)->allocate(bytes ? bytes : 1);
     auto *holder = new c10::DataPtr(std::move(dp));
     auto opts = at::TensorOptions()
-                    .dtype(at::kFloat)
+                    .dtype(dtype)
                     .device(c10::Device(kDev, kDevIndex));
     return at::from_blob(holder->get(), sizes,
                          [holder](void *) { delete holder; }, opts);
+}
+
+static at::Tensor make_arena_tensor(c10::IntArrayRef sizes)
+{
+    return make_arena_tensor_dtype(sizes, at::kFloat);
 }
 
 static at::Tensor vc4_empty(c10::IntArrayRef size,
@@ -382,9 +388,11 @@ static at::Tensor vc4_empty(c10::IntArrayRef size,
     TORCH_CHECK(!device || device->type() == kDev,
                 "torch_vc4: empty called for device ",
                 device ? device->str() : std::string("<none>"));
-    TORCH_CHECK(!dtype || *dtype == at::kFloat,
-                "torch_vc4: only float32 tensors are supported, got ",
-                dtype ? c10::toString(*dtype) : "float32");
+    const at::ScalarType want = dtype ? *dtype : at::kFloat;
+    TORCH_CHECK(want == at::kFloat || want == at::kLong,
+                "torch_vc4: only float32 tensors are supported (int64 is "
+                "accepted for bookkeeping buffers, e.g. batch-norm counters), "
+                "got ", c10::toString(want));
     TORCH_CHECK(!layout || *layout == at::kStrided,
                 "torch_vc4: only strided layout is supported");
     TORCH_CHECK(!pin_memory || !*pin_memory,
@@ -392,7 +400,7 @@ static at::Tensor vc4_empty(c10::IntArrayRef size,
     TORCH_CHECK(!memory_format ||
                     *memory_format == at::MemoryFormat::Contiguous,
                 "torch_vc4: only contiguous memory format is supported");
-    return make_arena_tensor(size);
+    return make_arena_tensor_dtype(size, want);
 }
 
 static at::Tensor vc4_empty_strided(c10::IntArrayRef size,
@@ -442,12 +450,14 @@ static at::Tensor &vc4_copy_(at::Tensor &self, const at::Tensor &src,
     TORCH_CHECK(self.scalar_type() == src.scalar_type(),
                 "torch_vc4: copy_ does not convert dtypes (",
                 self.scalar_type(), " vs ", src.scalar_type(), ")");
-    TORCH_CHECK(self.scalar_type() == at::kFloat,
-                "torch_vc4: only float32 is supported");
+    TORCH_CHECK(self.scalar_type() == at::kFloat ||
+                    self.scalar_type() == at::kLong,
+                "torch_vc4: copy_ supports float32 and int64 only, got ",
+                self.scalar_type());
 
     State &s = state();
     std::lock_guard<std::mutex> g(s.gpu_mu);
-    size_t bytes = (size_t)self.numel() * sizeof(float);
+    size_t bytes = (size_t)self.numel() * self.element_size();
 
     if (src_vc4 && !self_vc4) {
         TORCH_CHECK(self.is_contiguous(),
@@ -801,15 +811,21 @@ static at::Tensor vc4_as_strided(const at::Tensor &t, c10::IntArrayRef sizes,
 static at::Tensor &vc4_fill_(at::Tensor &self, const at::Scalar &value)
 {
     ensure_init();
-    check_vc4_f32(self, "fill_");
-    TORCH_CHECK(self.is_contiguous(), "torch_vc4: fill_ needs a contiguous "
-                                      "tensor");
+    TORCH_CHECK(self.device().type() == kDev && self.is_contiguous(),
+                "torch_vc4: fill_ needs a contiguous vc4 tensor");
     size_t n = (size_t)self.numel();
-    std::vector<float> buf(n, (float)value.toDouble());
     State &s = state();
     std::lock_guard<std::mutex> g(s.gpu_mu);
     vc4_buf b = buf_of(self);
-    vc4_status st = vc4_upload(s.ctx, &b, buf.data(), n * sizeof(float));
+    vc4_status st = VC4_OK;
+    if (self.scalar_type() == at::kLong) {
+        std::vector<int64_t> buf(n, value.toLong());
+        st = vc4_upload(s.ctx, &b, buf.data(), n * sizeof(int64_t));
+    } else {
+        check_vc4_f32(self, "fill_");
+        std::vector<float> buf(n, (float)value.toDouble());
+        st = vc4_upload(s.ctx, &b, buf.data(), n * sizeof(float));
+    }
     if (st != VC4_OK)
         throw_st(st, "fill_");
     return self;
@@ -882,8 +898,22 @@ static at::Scalar vc4_local_scalar_dense(const at::Tensor &t)
 {
     TORCH_CHECK(t.numel() == 1, "torch_vc4: item() needs a one-element tensor, "
                                "got ", t.sizes());
-    auto v = host_get(t);
-    return at::Scalar((double)v[0]);
+    ensure_init();
+    State &s = state();
+    std::lock_guard<std::mutex> g(s.gpu_mu);
+    vc4_buf b = buf_of(t);
+    if (t.scalar_type() == at::kLong) {
+        int64_t v = 0;
+        vc4_status st = vc4_download(s.ctx, &b, &v, sizeof(v));
+        if (st != VC4_OK)
+            throw_st(st, "item");
+        return at::Scalar(v);
+    }
+    float v = 0;
+    vc4_status st = vc4_download(s.ctx, &b, &v, sizeof(v));
+    if (st != VC4_OK)
+        throw_st(st, "item");
+    return at::Scalar((double)v);
 }
 
 /* --------------------------------------------------- elementwise bindings */
@@ -1790,6 +1820,37 @@ static void vc4_touch(const at::Tensor &t)
     invalidate_for_cpu(t);
 }
 
+/* ------------------------------------------------------------ uniform_ (RNG) */
+/* Module initialisation (`nn.Linear`, `nn.Conv2d` constructed on the device)
+ * calls uniform_; like normal_ the numbers come from the host std::mt19937 and
+ * are uploaded.  Data generation, not compute. */
+static at::Tensor &vc4_uniform_(at::Tensor &self, double from, double to,
+                                std::optional<at::Generator> generator)
+{
+    (void)generator;
+    ensure_init();
+    check_vc4_f32(self, "uniform_");
+    TORCH_CHECK(self.is_contiguous(),
+                "torch_vc4: uniform_ needs a contiguous tensor");
+    TORCH_CHECK(from <= to, "torch_vc4: uniform_: from > to");
+    size_t n = (size_t)self.numel();
+    std::vector<float> host(n);
+    {
+        State &s = state();
+        std::lock_guard<std::mutex> g(s.alloc_mu);
+        std::uniform_real_distribution<float> dist((float)from, (float)to);
+        for (size_t i = 0; i < n; ++i)
+            host[i] = dist(s.rng);
+    }
+    std::lock_guard<std::mutex> g(state().gpu_mu);
+    vc4_buf b = buf_of(self);
+    vc4_status st = vc4_upload(state().ctx, &b, host.data(),
+                               n * sizeof(float));
+    if (st != VC4_OK)
+        throw_st(st, "uniform_");
+    return self;
+}
+
 /* ---------------------------------------------------------------- fallback */
 
 static void vc4_fallback(const c10::OperatorHandle &op, c10::DispatchKeySet,
@@ -1867,6 +1928,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m)
     m.impl("mul.Tensor", TORCH_FN(torch_vc4::vc4_mul));
     m.impl("relu", TORCH_FN(torch_vc4::vc4_relu));
     m.impl("normal_", TORCH_FN(torch_vc4::vc4_normal_));
+    m.impl("uniform_", TORCH_FN(torch_vc4::vc4_uniform_));
     m.impl("fill_.Scalar", TORCH_FN(torch_vc4::vc4_fill_));
     m.impl("zero_", TORCH_FN(torch_vc4::vc4_zero_));
     m.impl("view", TORCH_FN(torch_vc4::vc4_view));
