@@ -568,10 +568,9 @@ def register():
     impl("_softmax", softmax)
     impl("sigmoid", sigmoid)
     impl("silu", silu)
-    impl("view", lambda x, size: view(x, size))
+    # aten::view/aten::as_strided are registered natively (csrc) -- the
+    # Python layer only supplies the autograd Functions for them.
     impl("flatten.using_ints", flatten)
-    impl("as_strided",
-         lambda x, size, stride, off=None: as_strided(x, size, stride, off))
     impl("cat", cat)
     impl("upsample_nearest2d", upsample_nearest2d)
     impl("upsample_nearest2d.vec", upsample_nearest2d_vec)
