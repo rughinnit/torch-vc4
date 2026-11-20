@@ -372,7 +372,11 @@ def _conv2d_nhwc(x, w, b, stride, pad, depthwise, native_dw):
         y = T.conv_nhwc(xp, panel, N, cpad, H, W, opad, k, k, stride, pad, 1)
     ho = y.shape[1]
     wo = (W + 2 * pad - k) // stride + 1
-    return T.nhwc_unpack(y, N, Cout, ho, wo)
+    out = T.nhwc_unpack(y, N, Cout, ho, wo)
+    if native_dw and b is not None:
+        # vc4_depthwise_nhwc takes no bias; add it on the QPU (broadcast)
+        out = _binary(out, b.view(1, Cout, 1, 1), "add")
+    return out
 
 
 def _conv2d_nchw(x, w, b, stride, pad, depthwise):
@@ -402,16 +406,15 @@ def _conv2d_nchw(x, w, b, stride, pad, depthwise):
 def conv2d(x, w, b, stride=1, pad=0, groups=1):
     N, C, H, W, Cout, k, stride, pad, depthwise = _conv_geom(
         x, w, b, stride, pad, groups)
-    if N == 1:
-        return _conv2d_nchw(x, w, b, stride, pad, depthwise)
-    # Batches use one launch per image on the same verified kernels.  The
-    # engine's batched NHWC path (vc4_conv_nhwc) hung the GPU on this board
-    # (its weight-pack launch returned VC4_ERR_TIMEOUT), so it is not wired
-    # (COMPLETENESS.md §6).
-    parts = [_conv2d_nchw(x[n:n + 1], w, b, stride, pad, depthwise)
-             for n in range(N)]
-    y = T.cat_ch([p.view(p.shape[1], p.shape[2], p.shape[3]) for p in parts])
-    return y.view(N, Cout, y.shape[1], y.shape[2])
+    # The engine's batched NHWC kernels take stride 1/2 and a whole batch in
+    # one launch; the native 3x3 depthwise kernel covers pad-1/stride-1, the
+    # other depthwise cases use its exact block-diagonal decomposition.
+    # Re-verified against the engine test (test_nhwc 5) and vs the CPU in
+    # tests/test_complete.py; see COMPLETENESS.md item 6 for the exact call.
+    native_dw = depthwise and k == 3 and stride == 1 and pad == 1
+    if N > 1 or stride == 2 or native_dw:
+        return _conv2d_nhwc(x, w, b, stride, pad, depthwise, native_dw)
+    return _conv2d_nchw(x, w, b, stride, pad, depthwise)
 
 
 def _conv2d_backward_single(x, w, dy, stride, pad, groups):

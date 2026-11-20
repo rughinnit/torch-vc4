@@ -11,8 +11,9 @@ import torch.nn.functional as F
 
 import torch_vc4 as tv
 
+torch.set_num_threads(4)
 D = tv.device()
-REPS = 3
+REPS = 5
 ROWS = []
 
 
@@ -21,13 +22,16 @@ def U(t):
 
 
 def timeit(fn, reps=REPS):
+    """Median of `reps` after two warm-up calls (protocol: threads=4)."""
     fn()
-    best = 1e9
+    fn()
+    ts = []
     for _ in range(reps):
         t0 = time.perf_counter()
         fn()
-        best = min(best, time.perf_counter() - t0)
-    return best * 1e3
+        ts.append(time.perf_counter() - t0)
+    ts.sort()
+    return ts[len(ts) // 2] * 1e3
 
 
 def err(got, ref):
@@ -57,6 +61,9 @@ def row(name, backend, sizes, build):
 def main():
     torch.manual_seed(3)
     print("# raw completeness measurements (generated)\n")
+    print("# protocol: Pi 3B stock clocks, torch.set_num_threads(4),")
+    print("#           vc4d active, no other GPU client, median of %d" % REPS)
+    print("#           after 2 warm-ups; vc4 wall includes the vc4d round trip.\n")
 
     # gemm
     def b_mm(sh):
@@ -67,6 +74,16 @@ def main():
                 torch.mm(av, bv), torch.mm(a, b))
     row("aten::mm", "device", [(32, 32, 32), (128, 128, 128),
                                (256, 256, 256)], b_mm)
+    n = 256
+    a, b = torch.randn(n, n), torch.randn(n, n)
+    av, bv = U(a), U(b)
+    torch.mm(av, bv)
+    tv.reset_stats()
+    for _ in range(5):
+        torch.mm(av, bv)
+    st = tv.stats()
+    print("# mm 256^3: engine GPU %.3f ms/call (kernel+pack), %d launches/5\n"
+          % (st["kernel_ms"] / 5.0, int(st["launches"])))
 
     def b_linear(sh):
         n, k, m = sh
