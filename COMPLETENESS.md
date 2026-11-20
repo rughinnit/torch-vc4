@@ -137,7 +137,7 @@ the table stays readable.
   NHWC input `[2][8][8][16]`, weight `[16][16][3][3]`, bias `[16]`, panel
   `[16][16][3][3]`, `in_pitch=8` — now succeeds and matches the CPU to
   1.9e-05.  The timeout happened while the engine archive and its
-  name-keyed kernel cache were being rebuilt by a concurrent job (the
+  name-keyed kernel cache were being rebuilt concurrently (the
   stale-blob trap the engine documents), not in a steady build.  The backend
   now uses `vc4_conv_nhwc` for `batch > 1` and `stride 2`, and
   `vc4_depthwise_nhwc` for 3x3/stride-1/pad-1 depthwise (that kernel has no
