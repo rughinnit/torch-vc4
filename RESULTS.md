@@ -7,6 +7,12 @@ One boot of the Raspberry Pi 3B, stock clocks (V3D 300 MHz, ARM 1200 MHz,
 Date of the run: 2026-11-19, Debian 13 (trixie) arm64, Python 3.13.5,
 glibc 2.41, torch 2.15.0+cpu.
 
+> **Superseded for the op table and for all timings by `COMPLETENESS.md`
+> (0.3.0)**, which records the quiet-board re-measurement, the measurement
+> protocol (threads pinned, `vc4d` active, no other GPU client, median of N)
+> and the ops added since this 2026-11-19 run.  Keep this file as the dated
+> log of that boot.
+
 ## Step 0 — is there a wheel?
 
 | item | result |

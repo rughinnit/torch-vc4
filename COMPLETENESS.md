@@ -30,11 +30,11 @@ measured.**  At `mm 256x256x256` the `torch_vc4` call takes **5.09 ms vs
 3.632 ms on the CPU** (9.24 GFLOP/s CPU; **1.40x slower**), of which the raw
 engine accounts for 3.996 ms (8.40 GFLOP/s, **1.10x slower than the CPU**).
 A 64-float `relu` costs 0.244 ms vs 0.018 ms (13x), a 64-float `add` 1.23 ms
-vs 0.018 ms (67x), and `mm 32x32x32` 0.42 ms vs 0.040 ms (10x).  The earlier
-"1.7x slower" figure in the README/RESULTS was load-contaminated, not a
-cold-cache effect; both a "1.2x faster" and a "1.7x slower" reading were
-taken while a concurrent job was running.  The numbers above are the
-quiet-board re-measurement.
+vs 0.018 ms (67x), and `mm 32x32x32` 0.42 ms vs 0.040 ms (10x).  An earlier
+"1.7x slower" figure was **load-contaminated** (a concurrent job was
+running), not a cold-cache effect; a "1.2x faster" reading taken in the same
+window was contaminated too.  The numbers above are the quiet-board
+re-measurement.
 
 This backend is useful because the ops are real GPU kernels with a verified
 numerical contract, not because it beats a 1.2 GHz Cortex-A53.
