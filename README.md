@@ -1,5 +1,11 @@
 # torch-vc4 — a subset PyTorch backend for the Raspberry Pi VideoCore IV
 
+> Part of the **VC4 stack**. The main repository — engine, kernels,
+> measurements, documentation and issue tracker — is
+> [`rughinnit/vc4-stack`](https://github.com/rughinnit/vc4-stack); see
+> `docs/ECOSYSTEM.md` there for how the repositories fit together.
+
+
 Status: **feature-complete for the model families it declares** (version
 0.3.0). `torch_vc4.device()` is a real PyTorch device (`PrivateUse1`,
 renamed `vc4`).  Batch > 1, arbitrary-dim reductions, softmax for any class
