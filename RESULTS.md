@@ -429,7 +429,7 @@ that it is faster than four Cortex-A53 cores for tensors that fit in cache.
   exhausted" (24 MiB requested, 4 MiB refused, on a fresh boot).  The
   backend retries the allocation for ~10 s and the test runner restarts the
   daemon per file.
-- The board is shared: a concurrent job ran GPU work in `~/work/vc4-stack-sub`
-  during this run, rebuilt the engine tree this backend links against
+- The board is shared: GPU work ran concurrently in `~/work/vc4-stack-sub`
+  during this run, and the engine tree this backend links against was rebuilt
   (hence the static link), and its killed clients contributed to the wedges.
   Run one GPU client at a time.
