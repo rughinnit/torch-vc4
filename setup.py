@@ -5,8 +5,8 @@ from torch.utils.cpp_extension import BuildExtension, CppExtension
 
 # The engine tree this backend is built against.  It must be the checkout that
 # has the training/ONNX kernels (conv backward, maxpooln, softmax_fwd,
-# matmul_bt), i.e. vc4-stack/engine.
-ENGINE = os.environ.get("VC4_ENGINE_DIR", "/home/raspi/work/vc4-stack/engine")
+# matmul_bt), i.e. vc4-stack/infer (was vc4-stack/engine before the reorg).
+ENGINE = os.environ.get("VC4_ENGINE_DIR", "/home/raspi/work/vc4-stack/infer")
 VC4D = os.environ.get("VC4D_DIR", "/home/raspi/work/vc4d")
 
 # Linked *statically* on purpose: the engine's shared object gained an
