@@ -11,7 +11,7 @@
 # it failed for one of those two environmental reasons.
 set -u
 cd "$(dirname "$0")/.." || exit 1
-PY=".venv/bin/python"
+PY="${PYTHON:-.venv/bin/python}"
 [ -x "$PY" ] || { echo "no venv at $PWD/$PY"; exit 1; }
 
 run() {
@@ -19,7 +19,7 @@ run() {
     shift
     attempt=1
     while [ "$attempt" -le 5 ]; do
-        sudo systemctl restart vc4d
+        sudo systemctl restart "${VC4D_UNIT:-vc4d}"
         sleep 1
         log="/tmp/torch_vc4_${name}.log"
         "$PY" "$@" >"$log" 2>&1
@@ -28,7 +28,7 @@ run() {
             echo "=== $name: PASS"
             return 0
         fi
-        if grep -qE "out of arena memory|GPU timeout|daemon is dead" "$log"; then
+        if grep -qE "out of arena memory|out of arena/slots|arena exhausted|GPU timeout|daemon is dead|device I/O error|denied by daemon policy|context is dead" "$log"; then
             echo "=== $name: environmental failure (attempt $attempt), retrying"
             attempt=$((attempt + 1))
             sleep 3
@@ -44,6 +44,7 @@ run() {
 
 fails=0
 run ops tests/test_ops.py || fails=$((fails + 1))
+run complete tests/test_complete.py || fails=$((fails + 1))
 run autograd tests/test_autograd.py || fails=$((fails + 1))
 run strict tests/test_backend.py || fails=$((fails + 1))
 

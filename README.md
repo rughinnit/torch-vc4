@@ -1,12 +1,15 @@
 # torch-vc4 — a subset PyTorch backend for the Raspberry Pi VideoCore IV
 
-Status: **subset backend with autograd, working**. `torch_vc4.device()` is a
-real PyTorch device (`PrivateUse1`, renamed `vc4`).  A small CNN —
-conv/relu/pool/conv/relu/flatten/fc — trains on it with
-`loss.backward()` and hand-written SGD; forward parity against the CPU and
-gradient parity to ≤1.2e-3 relative are measured in `RESULTS.md`.
-Everything outside the op table below **raises**; there is no CPU fallback
-and no pretence of one.
+Status: **feature-complete for the model families it declares** (version
+0.3.0). `torch_vc4.device()` is a real PyTorch device (`PrivateUse1`,
+renamed `vc4`).  Batch > 1, arbitrary-dim reductions, softmax for any class
+count, N-D broadcasting, training-mode batch norm, batched/stride-2/depthwise
+conv, the verified unary set, gather/index_select/argmax and autograd for all
+of it are measured against the CPU in `tests/test_complete.py`.
+**`COMPLETENESS.md` is the authoritative op table**: every intercepted aten op
+with its backend (device / composite / raise), measured accuracy and vc4-vs-CPU
+time at three sizes, plus the precise reason for every raise.  Everything
+outside that table **raises**; there is no CPU fallback and no pretence of one.
 
 Tensors live in the engine's dma-buf arena (`libvc4infer`), and every GPU
 launch goes through **vc4d**, so the Python process is unprivileged: one
@@ -55,15 +58,33 @@ is unset the backend points it at the first tree that has `qenc.py`
 `/home/raspi/work/asm3`).  Without it, JIT of any shape not already in the
 cache fails.
 
+## Install from the signed package archive
+
+The 0.3.0 wheel is published next to `vc4infer`:
+
+```sh
+pip install --extra-index-url https://rughinnit.github.io/vc4-apt/pip/simple/ \
+    torch_vc4
+# or the wheel directly
+pip install https://rughinnit.github.io/vc4-apt/pip/torch_vc4-0.3.0-cp313-cp313-linux_aarch64.whl
+```
+
+The wheel is a **cp313 / aarch64 binary** because the backend is a compiled
+extension statically linked against `libvc4infer.a`; install it on the Pi
+(with the `+cpu` torch wheel), not on a host.
+
 ## Run
 
 ```sh
 cd /home/raspi/work/torch-vc4
 .venv/bin/python tests/test_ops.py        # forward parity + strict rejection
+.venv/bin/python tests/test_complete.py   # batches, reductions, softmax, ...
 .venv/bin/python tests/test_autograd.py   # gradient parity + tiny CNN training
 .venv/bin/python tests/test_backend.py    # the original acceptance test
 .venv/bin/python tests/bench_ops.py       # per-op cost vs the CPU
-sh tests/run_all.sh                       # all three suites, one daemon each
+sh tests/run_all.sh                       # all four suites, one daemon each
+# run the same suite against an installed wheel:
+PYTHON=/path/to/cleanvenv/bin/python sh tests/run_all.sh
 ```
 
 `run_all.sh` restarts `vc4d` before each test file on purpose; see

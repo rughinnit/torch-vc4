@@ -6,13 +6,17 @@ Python/ARM side only
 
   * reshapes/views (metadata), and
   * moves bytes (channel padding, phase images, weight permutes, concat,
-    nearest resampling, compaction) and materialises constants,
+    nearest resampling, broadcast expansion, index gathers, compaction) and
+    materialises constants,
 
 all through ``torch.ops.torch_vc4.*`` (csrc/torch_vc4.cpp).  There is no CPU
 maths and no CPU fallback: a shape or attribute the engine cannot do raises.
 
-Batch size 1 only: the engine runs one image per launch and this backend does
-not hide a host loop over the batch.
+Batches run through the engine's batched NHWC conv path; pools/resize/cat
+use one launch per image.  Reductions over arbitrary dims are GEMMs
+(sum/mean) or a relu/sign max tree (amax/amin) because the engine's generic
+``vc4_reduce``/``vc4_gather`` kernels hang this board (measured; see
+COMPLETENESS.md).  Gather/index_select are host word gathers (pure copies).
 """
 
 import math
@@ -67,6 +71,204 @@ def _pair(v):
     return int(v), int(v)
 
 
+def _norm_dim(d, nd, what="op"):
+    d = int(d)
+    if d < 0:
+        d += nd
+    if d < 0 or d >= nd:
+        raise RuntimeError("torch_vc4: %s: dim %d is out of range for a %d-D "
+                           "tensor" % (what, d, nd))
+    return d
+
+
+def _norm_dims(dims, nd, what="op"):
+    if dims is None:
+        return list(range(nd))
+    if isinstance(dims, int):
+        dims = [dims]
+    out = []
+    for d in dims:
+        d = _norm_dim(d, nd, what)
+        if d not in out:
+            out.append(d)
+    return out
+
+
+# ----------------------------------------------------------- layout helpers
+
+def _permute_dims(t, order):
+    """Metadata permutation + materialise (host word gather, no arithmetic)."""
+    order = [int(i) for i in order]
+    if order == list(range(t.dim())):
+        return t
+    sizes = [t.shape[i] for i in order]
+    strides = [t.stride(i) for i in order]
+    v = T.as_strided_alias(t, sizes, strides, t.storage_offset())
+    return T.materialize(v)
+
+
+def _expand(t, shape):
+    """Right-aligned broadcast by materialising a 0-stride view.
+
+    The arithmetic on the result is on the QPU; this is a byte replication
+    (the same class of work as contiguous()), not a compute fallback.
+    """
+    shape = tuple(int(s) for s in shape)
+    if tuple(t.shape) == shape:
+        return t
+    f32(t, "broadcast")
+    lead = len(shape) - t.dim()
+    if lead < 0:
+        raise RuntimeError("torch_vc4: cannot broadcast %s to %s"
+                           % (tuple(t.shape), shape))
+    sizes = (1,) * lead + tuple(t.shape)
+    strides = (0,) * lead + tuple(t.stride()) if t.dim() else (0,) * lead
+    ns, nst = [], []
+    for s, o, st in zip(sizes, shape, strides):
+        if s == o:
+            ns.append(o)
+            nst.append(st)
+        elif s == 1:
+            ns.append(o)
+            nst.append(0)
+        else:
+            raise RuntimeError(
+                "torch_vc4: cannot broadcast %s to %s (dim %d: %d vs %d)"
+                % (tuple(t.shape), shape, len(ns), s, o))
+    v = T.as_strided_alias(t, ns, nst, t.storage_offset())
+    return T.materialize(v)
+
+
+def _slice_last(x2, start, step, length):
+    """x2[:, start : start+length*step : step] as a contiguous [outer][len]."""
+    outer, red = x2.shape
+    if length <= 0:
+        raise RuntimeError("torch_vc4: empty slice")
+    v = T.as_strided_alias(x2, [outer, length], [red, step],
+                           x2.storage_offset() + start)
+    return T.materialize(v)
+
+
+def contiguous(t):
+    """A contiguous tensor with the same values (byte copy when needed)."""
+    f32(t, "contiguous")
+    return t if t.is_contiguous() else T.materialize(t)
+
+
+# ------------------------------------------------------ reduce machinery
+
+def _ones_like_rows(rows, cols, like):
+    return torch.ones((rows, cols), dtype=torch.float32, device=like.device)
+
+
+def _sum_last(x2):
+    """[outer][red] -> [outer], a GEMM with a ones vector."""
+    outer, red = x2.shape
+    if red == 0:
+        raise RuntimeError("torch_vc4: reduction over an empty dimension")
+    if outer == 1:
+        return T.sum_all(x2.view(-1)).view(1)
+    ones = _ones_like_rows(red, 1, x2)
+    return torch.mm(x2, ones).view(outer)
+
+
+def _select_max(a, b):
+    """Elementwise max(a,b) = b + relu(a-b) (one rounding; ~1 ulp)."""
+    d = T.add(a, T.mul_scalar(b, -1.0))
+    return T.add(b, torch.relu(d))
+
+
+def _max_last(x2):
+    """[outer][red] -> [outer] max, a balanced relu tree on the QPU.
+
+    Odd levels carry the unpaired last column (and its negation for min) to
+    the end; every other comparison is vectorised over the whole row.
+    """
+    outer, red = x2.shape
+    leftovers = []
+    cur = x2
+    while cur.shape[1] > 1:
+        n = cur.shape[1]
+        if n % 2:
+            leftovers.append(_slice_last(cur, n - 1, 1, 1))
+            cur = _slice_last(cur, 0, 1, n - 1)
+        h = cur.shape[1] // 2
+        a = _slice_last(cur, 0, 2, h)
+        b = _slice_last(cur, 1, 2, h)
+        cur = _select_max(a, b)
+    for t in leftovers:
+        cur = _select_max(cur, t)
+    return cur.view(outer)
+
+
+def _min_last(x2):
+    return T.mul_scalar(_max_last(T.mul_scalar(x2, -1.0)), -1.0)
+
+
+def _dims_reduce(t, dims, keepdim, op):
+    """Reduce ``t`` over ``dims`` (sum/mean/max/min) on the QPU.
+
+    The tensor is permuted so the reduced dims are last (a byte gather), then
+    flattened to [outer][red]: sums are one GEMM, max/min a relu tree.
+    """
+    nd = t.dim()
+    dims = _norm_dims(dims, nd)
+    keep = [i for i in range(nd) if i not in dims]
+    order = keep + dims
+    xp = _permute_dims(t, order)
+    kept_shape = tuple(t.shape[i] for i in keep)
+    red = 1
+    for i in dims:
+        red *= t.shape[i]
+    outer = t.numel() // red
+    x2 = xp.view(outer, red)
+    if op in ("sum", "mean"):
+        r = _sum_last(x2)
+        if op == "mean":
+            r = T.mul_scalar(r, 1.0 / red)
+    elif op == "max":
+        r = _max_last(x2)
+    elif op == "min":
+        r = _min_last(x2)
+    else:  # pragma: no cover
+        raise RuntimeError("torch_vc4: unknown reduction %r" % (op,))
+    if keepdim:
+        shape = [1] * nd
+        for k, i in enumerate(keep):
+            shape[i] = t.shape[i]
+        return r.view(shape)
+    return r.view(kept_shape)
+
+
+def _expand_reduced(g, shape, dims):
+    """Broadcast a reduction gradient back over the reduced dims (0 strides)."""
+    nd = len(shape)
+    dims = _norm_dims(dims, nd)
+    keep = [i for i in range(nd) if i not in dims]
+    if tuple(g.shape) != tuple(shape[i] for i in keep):
+        g = g.view([shape[i] for i in keep])
+    strides = [0] * nd
+    gs = list(g.stride())
+    for k, i in enumerate(keep):
+        strides[i] = gs[k]
+    v = T.as_strided_alias(g, list(shape), strides, g.storage_offset())
+    return T.materialize(v)
+
+
+def _sum_to(g, shape):
+    """Sum a broadcast gradient back down to ``shape``."""
+    if tuple(g.shape) == tuple(shape):
+        return g
+    f32(g, "broadcast-backward")
+    lead = g.dim() - len(shape)
+    if lead > 0:
+        g = _dims_reduce(g, list(range(lead)), False, "sum")
+    dims = [i for i, s in enumerate(shape) if s == 1 and g.shape[i] != 1]
+    if dims:
+        g = _dims_reduce(g, dims, True, "sum")
+    return g.reshape(shape)
+
+
 # ------------------------------------------------------------------- conv2d
 
 def phase_q(pad):
@@ -94,9 +296,8 @@ def _conv_geom(x, w, b, stride, pad, groups):
                            % (x.dim(), w.dim()))
     N, C, H, W = x.shape
     Cout, Cin, kh, kw = w.shape
-    if N != 1:
-        raise RuntimeError("torch_vc4: conv2d runs batch size 1 (got %d); the "
-                           "engine processes one image per launch" % N)
+    if N < 1:
+        raise RuntimeError("torch_vc4: conv2d needs a non-empty batch")
     depthwise = groups != 1
     if depthwise:
         if groups != C:
@@ -117,7 +318,7 @@ def _conv_geom(x, w, b, stride, pad, groups):
     if stride not in (1, 2):
         raise RuntimeError("torch_vc4: conv2d supports stride 1 and 2, got %d"
                            % stride)
-    if kh == 1 and (pad != 0 or stride not in (1, 2)):
+    if kh == 1 and pad != 0:
         raise RuntimeError("torch_vc4: conv2d 1x1 takes padding 0")
     if pad < 0 or pad > kh // 2:
         raise RuntimeError("torch_vc4: conv2d padding %d is outside PyTorch's "
@@ -127,7 +328,7 @@ def _conv_geom(x, w, b, stride, pad, groups):
         if b.dim() != 1 or b.numel() != Cout:
             raise RuntimeError("torch_vc4: conv2d bias must be [%d], got %s"
                                % (Cout, tuple(b.shape)))
-    return C, H, W, Cout, kh, stride, pad, depthwise
+    return N, C, H, W, Cout, kh, stride, pad, depthwise
 
 
 def _padded(w, b, C, Cout, depthwise):
@@ -145,9 +346,39 @@ def _padded(w, b, C, Cout, depthwise):
     return wd, bp, cpad, opad
 
 
-def conv2d(x, w, b, stride=1, pad=0, groups=1):
-    C, H, W, Cout, k, stride, pad, depthwise = _conv_geom(
-        x, w, b, stride, pad, groups)
+def _conv2d_nhwc(x, w, b, stride, pad, depthwise, native_dw):
+    """Whole-batch conv through the engine's NHWC kernels (stride 1/2).
+
+    depthwise + 3x3/s1/p1 uses the engine's native depthwise kernel; the other
+    depthwise cases use its exact dense block-diagonal decomposition (same
+    MACs, no host loop).
+    """
+    N, C, H, W, Cout, k, stride, pad, _ = _conv_geom(
+        x, w, b, stride, pad, x.shape[1] if depthwise else 1)
+    cpad, opad = _align16(C), _align16(Cout)
+    xp = T.nhwc_pack(x, cpad)                     # [N][H][W][cpad]
+    if native_dw:
+        panel = T.depthwise_panel(w, cpad)
+        y = T.depthwise_nhwc(xp, panel, N, cpad, H, W)
+    else:
+        if depthwise:
+            wd = T.dense_dw_w(w, cpad, opad)
+        elif cpad != C or opad != Cout:
+            wd = T.pad_w(w, cpad, opad)
+        else:
+            wd = w
+        bp = T.pad_ch(b, opad) if (b is not None and opad != Cout) else b
+        panel = T.conv_nhwc_pack_w(wd, bp, cpad, opad)
+        y = T.conv_nhwc(xp, panel, N, cpad, H, W, opad, k, k, stride, pad, 1)
+    ho = y.shape[1]
+    wo = (W + 2 * pad - k) // stride + 1
+    return T.nhwc_unpack(y, N, Cout, ho, wo)
+
+
+def _conv2d_nchw(x, w, b, stride, pad, depthwise):
+    """One image through the engine's verified NCHW conv / phase path."""
+    N, C, H, W, Cout, k, stride, pad, _ = _conv_geom(
+        x, w, b, stride, pad, x.shape[1] if depthwise else 1)
     wd, bp, cpad, opad = _padded(w, b, C, Cout, depthwise)
     x3 = x.view(C, H, W)
     xp = T.pad_ch(x3, cpad) if cpad != C else x3
@@ -168,9 +399,23 @@ def conv2d(x, w, b, stride=1, pad=0, groups=1):
     return y3.view(1, Cout, y3.shape[1], y3.shape[2])
 
 
-def conv2d_backward(x, w, dy, stride=1, pad=0, groups=1):
-    """dX, dW for the forward above, using the engine's dX/dW kernels."""
-    C, H, W, Cout, k, stride, pad, depthwise = _conv_geom(
+def conv2d(x, w, b, stride=1, pad=0, groups=1):
+    N, C, H, W, Cout, k, stride, pad, depthwise = _conv_geom(
+        x, w, b, stride, pad, groups)
+    if N == 1:
+        return _conv2d_nchw(x, w, b, stride, pad, depthwise)
+    # Batches use one launch per image on the same verified kernels.  The
+    # engine's batched NHWC path (vc4_conv_nhwc) hung the GPU on this board
+    # (its weight-pack launch returned VC4_ERR_TIMEOUT), so it is not wired
+    # (COMPLETENESS.md §6).
+    parts = [_conv2d_nchw(x[n:n + 1], w, b, stride, pad, depthwise)
+             for n in range(N)]
+    y = T.cat_ch([p.view(p.shape[1], p.shape[2], p.shape[3]) for p in parts])
+    return y.view(N, Cout, y.shape[1], y.shape[2])
+
+
+def _conv2d_backward_single(x, w, dy, stride, pad, groups):
+    _, C, H, W, Cout, k, stride, pad, depthwise = _conv_geom(
         x, w, None, stride, pad, groups)
     f32(dy, "conv2d_backward(dy)")
     ho = (H + 2 * pad - k) // stride + 1
@@ -207,11 +452,32 @@ def conv2d_backward(x, w, dy, stride=1, pad=0, groups=1):
     return dx3.view(1, C, H, W), dw
 
 
+def conv2d_backward(x, w, dy, stride=1, pad=0, groups=1):
+    """dX, dW for the forward above, using the engine's dX/dW kernels."""
+    f32(x, "conv2d_backward(input)")
+    f32(dy, "conv2d_backward(dy)")
+    f32(w, "conv2d_backward(weight)")
+    N = x.shape[0]
+    if N == 1:
+        return _conv2d_backward_single(x, w, dy, stride, pad, groups)
+    dxs = []
+    dw = None
+    for n in range(N):
+        dxn, dwn = _conv2d_backward_single(
+            x[n:n + 1], w, dy[n:n + 1], stride, pad, groups)
+        dxs.append(dxn)
+        dw = dwn if dw is None else T.add(dw, dwn)
+    dx = T.cat_ch([d.view(d.shape[1], d.shape[2], d.shape[3]) for d in dxs])
+    return dx.view(N, x.shape[1], x.shape[2], x.shape[3]), dw
+
+
 def channel_sums(t3):
-    """Sum a [C][H][W] tensor over H,W -> [C], as one GEMM with a ones column."""
-    C, H, W = t3.shape
-    ones = torch.ones((H * W, 1), dtype=torch.float32, device=t3.device)
-    return torch.mm(t3.reshape(C, H * W), ones).view(C)
+    """Sum over all but the channel axis (GEMM with a ones vector)."""
+    C = t3.shape[0]
+    flat = t3.reshape(C, -1)
+    ones = torch.ones((flat.shape[1], 1), dtype=torch.float32,
+                      device=t3.device)
+    return torch.mm(flat, ones).view(C)
 
 
 # --------------------------------------------------------------- pooling
@@ -222,11 +488,11 @@ def max_pool2d(x, kernel_size, stride=None, padding=0, dilation=1,
     if x.dim() == 3:
         C, H, W = x.shape
         lead = ()
+        batches = [x]
     elif x.dim() == 4:
         N, C, H, W = x.shape
-        if N != 1:
-            raise RuntimeError("torch_vc4: max_pool2d runs batch size 1")
-        lead = (1,)
+        lead = (N,)
+        batches = [x[n] for n in range(N)]
     else:
         raise RuntimeError("torch_vc4: max_pool2d expects 3-D or 4-D input")
     k = _pair(kernel_size)
@@ -244,29 +510,44 @@ def max_pool2d(x, kernel_size, stride=None, padding=0, dilation=1,
     if p[0] > k[0] // 2:
         raise RuntimeError("torch_vc4: max_pool2d padding %d > kernel/2"
                            % p[0])
-    x3 = x.view(C, H, W)
-    if k[0] == 2 and s[0] == 2 and p[0] == 0 and H % 8 == 0 and W % 16 == 0:
-        y3 = T.maxpool2x2(x3)          # 2x2 argmax-mask kernel (has backward)
+
+    def one(x3):
+        if k[0] == 2 and s[0] == 2 and p[0] == 0 and H % 8 == 0 and W % 16 == 0:
+            return T.maxpool2x2(x3)
+        return T.maxpooln(x3, k[0], s[0], p[0])
+
+    ys = [one(b) for b in batches]
+    if len(ys) == 1:
+        y3 = ys[0]
     else:
-        y3 = T.maxpooln(x3, k[0], s[0], p[0])   # generic NxN/stride kernel
-    return y3.view(lead + tuple(y3.shape))
+        y3 = T.cat_ch([y.view(y.shape[0], y.shape[1], y.shape[2])
+                       for y in ys])
+    return y3.view(tuple(lead) + (C,) + tuple(y3.shape[1:]))
 
 
 def max_pool2d_backward(x, dy, k, s, p):
     f32(x, "max_pool2d(backward)")
     f32(dy, "max_pool2d(backward, dy)")
-    C, H, W = x.view(x.shape[-3], x.shape[-2], x.shape[-1]).shape
     if not (k == 2 and s == 2 and p == 0):
         raise RuntimeError(
             "torch_vc4: the backward of max_pool2d exists only for the "
             "engine's 2x2/stride-2 kernel (got %dx%d stride %d pad %d); "
             "the generic NxN pool is forward-only" % (k, k, s, p))
+    if x.dim() == 3:
+        C, H, W = x.shape
+        if H % 4 or W % 16:
+            raise RuntimeError(
+                "torch_vc4: max_pool2d backward needs H%%4==0 and W%%16==0 "
+                "(engine task geometry), got %dx%d" % (H, W))
+        return T.maxpool2x2_bwd(x, dy)
+    N, C, H, W = x.shape
     if H % 4 or W % 16:
         raise RuntimeError(
             "torch_vc4: max_pool2d backward needs H%%4==0 and W%%16==0 "
             "(engine task geometry), got %dx%d" % (H, W))
-    dx3 = T.maxpool2x2_bwd(x.view(C, H, W), dy.view(C, H // 2, W // 2))
-    return dx3.view(x.shape)
+    dxs = [T.maxpool2x2_bwd(x[n], dy[n]) for n in range(N)]
+    y = T.cat_ch(dxs)
+    return y.view(N, C, H, W)
 
 
 def adaptive_matrix(H, W, oh, ow):
@@ -289,11 +570,13 @@ def adaptive_avg_pool2d(x, output_size):
     if x.dim() == 3:
         C, H, W = x.shape
         lead = ()
+        rows = C
+        flat = x.view(C, H * W)
     elif x.dim() == 4:
         N, C, H, W = x.shape
-        if N != 1:
-            raise RuntimeError("torch_vc4: adaptive_avg_pool2d runs batch 1")
-        lead = (1,)
+        lead = (N,)
+        rows = N * C
+        flat = x.view(N * C, H * W)
     else:
         raise RuntimeError("torch_vc4: adaptive_avg_pool2d expects 3-D/4-D")
     oh, ow = _pair(output_size)
@@ -301,29 +584,134 @@ def adaptive_avg_pool2d(x, output_size):
         raise RuntimeError("torch_vc4: adaptive_avg_pool2d: empty output size")
     a = adaptive_matrix(H, W, oh, ow)          # [oh*ow][H*W] on the CPU
     avt = a.t().contiguous().to(x.device)      # upload: a byte copy
-    flat = x.view(C, H * W)
-    y = torch.mm(flat, avt)                    # [C][oh*ow], QPU GEMM
+    y = torch.mm(flat, avt)                    # [rows][oh*ow], QPU GEMM
     return y.view(lead + (C, oh, ow))
 
 
 # --------------------------------------------------------------- softmax
 
+def _exp_neg(x):
+    """exp(x) for x <= 0, from sigmoid(-x): exp(x) = (1-s)/s.
+
+    Only valid for non-positive arguments, which is all softmax needs after
+    the max subtraction.  The engine's own exp body is wrong in this build
+    (COMPLETENESS.md), so this composite is the device path.
+    """
+    s = T.sigmoid(T.mul_scalar(x, -1.0))
+    one_minus = T.add_scalar(T.mul_scalar(s, -1.0), 1.0)
+    r = T.rsqrt(s)
+    return T.mul(one_minus, T.mul(r, r))
+
+
 def softmax(x, dim, half_to_float=False):
     f32(x, "softmax")
     if x.dim() == 0:
         raise RuntimeError("torch_vc4: softmax of a scalar")
-    if dim != x.dim() - 1 and dim != -1:
-        raise RuntimeError("torch_vc4: softmax is implemented on the last dim "
-                           "only (got dim=%d of %d)" % (dim, x.dim()))
-    cols = x.shape[-1]
-    if cols > 16:
-        raise RuntimeError("torch_vc4: softmax supports at most 16 classes on "
-                           "the last dim (engine lane width), got %d" % cols)
-    y = T.softmax(x.view(-1, cols))
-    return y.view(x.shape)
+    nd = x.dim()
+    d = _norm_dim(dim, nd, "softmax")
+    perm = list(range(nd))
+    perm.append(perm.pop(d))
+    last = d == nd - 1
+    xp = x if last else _permute_dims(x, perm)
+    cols = xp.shape[-1]
+    rows = xp.numel() // cols
+    if cols == 0 or rows == 0:
+        raise RuntimeError("torch_vc4: softmax of an empty tensor")
+    x2 = xp.view(rows, cols)
+    if cols <= 16:
+        y2 = T.softmax(x2)                     # verified engine kernel
+    else:
+        m = _max_last(x2)
+        xm = T.add(x2, T.mul_scalar(_expand(m.view(rows, 1), (rows, cols)),
+                                    -1.0))
+        e = _exp_neg(xm)
+        tot = _sum_last(e)                     # [rows]
+        r = T.rsqrt(tot)
+        y2 = T.mul(e, _expand(T.mul(r, r).view(rows, 1), (rows, cols)))
+    y = y2.view(xp.shape)
+    if not last:
+        inv = [0] * nd
+        for i, p in enumerate(perm):
+            inv[p] = i
+        y = _permute_dims(y, inv)
+    return y
 
 
 # --------------------------------------------------------------- elementwise
+
+# vc4_uop values (include/vc4infer.h)
+(UOP_ABS, UOP_NEG, UOP_IDENTITY, UOP_CLIP, UOP_LEAKYRELU, UOP_FLOOR,
+ UOP_CEIL, UOP_ROUND, UOP_SIGN, UOP_EXP, UOP_LOG, UOP_SQRT, UOP_RECIPROCAL,
+ UOP_TANH, UOP_ERF, UOP_ELU, UOP_SELU, UOP_SOFTPLUS, UOP_SOFTSIGN, UOP_GELU,
+ UOP_GELU_ERF, UOP_HARDSIGMOID, UOP_HARDSWISH, UOP_SIN, UOP_COS) = range(25)
+
+# Unary ops whose QPU body this engine build measured correct on the board.
+# (genops_probe.py: abs/neg/sign/clip/leakyrelu/hardsigmoid/hardswish.)
+_VERIFIED_UOPS = {UOP_ABS, UOP_NEG, UOP_SIGN, UOP_CLIP, UOP_LEAKYRELU,
+                  UOP_HARDSIGMOID, UOP_HARDSWISH}
+
+_BROKEN = ("the engine's vc4_unary kernel for this op is present but returns "
+           "wrong numbers on this board (measured; see COMPLETENESS.md), so "
+           "it is not routed. No CPU fallback is used")
+
+
+def _uop(op, name, x, p0=0.0, p1=0.0, p2=0.0):
+    f32(x, name)
+    if op not in _VERIFIED_UOPS:
+        raise RuntimeError("torch_vc4: %s is unavailable: %s" % (name, _BROKEN))
+    return T.unary(x, int(op), float(p0), float(p1), float(p2))
+
+
+def _unavailable(name, why):
+    raise RuntimeError("torch_vc4: %s is unavailable on the vc4 backend: %s"
+                       % (name, why))
+
+
+def unary_abs(x):
+    return _uop(UOP_ABS, "abs", x)
+
+
+def unary_sign(x):
+    return _uop(UOP_SIGN, "sign", x)
+
+
+def unary_clip(x, lo=None, hi=None):
+    """clip as relu composites.
+
+    The engine's clip body takes the bounds as *uniform words*; vc4d's launch
+    policy rejects a uniform that aliases the GPU bus window, and any float
+    with |v| >= 2 and a negative sign (including -inf) has that bit pattern.
+    Composing from relu + a host-materialised constant keeps arbitrary bounds
+    working (COMPLETENESS.md).
+    """
+    f32(x, "clip")
+    if lo is not None and hi is not None and float(lo) > float(hi):
+        raise RuntimeError("torch_vc4: clip: min > max")
+    y = x
+    if lo is not None:
+        y = T.add_scalar(torch.relu(T.add_scalar(y, -float(lo))), float(lo))
+    if hi is not None:
+        # min(y, hi) = y - relu(y - hi)
+        y = T.add(y, T.mul_scalar(
+            torch.relu(T.add_scalar(y, -float(hi))), -1.0))
+    return y
+
+
+def unary_leaky_relu(x, slope=0.01):
+    """leaky_relu = relu(x) - slope*relu(-x), a device composite."""
+    f32(x, "leaky_relu")
+    pos = torch.relu(x)
+    neg = torch.relu(T.mul_scalar(x, -1.0))
+    return T.add(pos, T.mul_scalar(neg, -float(slope)))
+
+
+def unary_hardsigmoid(x):
+    return _uop(UOP_HARDSIGMOID, "hardsigmoid", x, 1.0 / 6.0, 0.5)
+
+
+def unary_hardswish(x):
+    return _uop(UOP_HARDSWISH, "hardswish", x, 1.0 / 6.0, 0.5)
+
 
 def sigmoid(x):
     f32(x, "sigmoid")
@@ -333,6 +721,149 @@ def sigmoid(x):
 def silu(x):
     f32(x, "silu")
     return T.silu(x)
+
+
+def tanh(x):
+    """tanh = 2*sigmoid(2x) - 1 (device composite; engine tanh body is wrong)."""
+    f32(x, "tanh")
+    if not x.numel():
+        return x
+    return T.add_scalar(T.mul_scalar(T.sigmoid(T.mul_scalar(x, 2.0)), 2.0),
+                        -1.0)
+
+
+def sqrt(x):
+    """sqrt = x * rsqrt(x) (engine rsqrt is the verified one used by BN)."""
+    f32(x, "sqrt")
+    if not x.numel():
+        return x
+    return T.mul(x, T.rsqrt(x))
+
+
+def reciprocal(x):
+    """1/x = sign(x) * rsqrt(|x|)^2 (rsqrt is the verified engine kernel)."""
+    f32(x, "reciprocal")
+    if not x.numel():
+        return x
+    r = T.rsqrt(T.unary(x, int(UOP_ABS), 0.0, 0.0, 0.0))
+    return T.mul(T.unary(x, int(UOP_SIGN), 0.0, 0.0, 0.0), T.mul(r, r))
+
+
+def gelu(x, approximate="none"):
+    """GELU.  Only the tanh approximation is available on the QPU.
+
+    x*sigmoid(2c(x + 0.044715 x^3)), c = sqrt(2/pi), which is exactly
+    0.5x(1+tanh(c(x+0.044715x^3))).  The exact erf form needs the engine's
+    erf body, which is wrong in this build.
+    """
+    f32(x, "gelu")
+    if approximate not in ("tanh",):
+        _unavailable(
+            "gelu(approximate=%r)" % (approximate,),
+            "the exact erf form needs the engine's erf kernel, which returns "
+            "wrong numbers in this build (measured; COMPLETENESS.md).  Use "
+            "approximate='tanh' (device composite) instead")
+    c = math.sqrt(2.0 / math.pi)
+    x3 = T.mul(x, T.mul(x, x))
+    z = T.mul_scalar(T.add(x, T.mul_scalar(x3, 0.044715)), 2.0 * c)
+    return T.mul(x, T.sigmoid(z))
+
+
+def unary_raise(name, why):
+    def f(x, *a, **k):
+        _unavailable(name, why)
+    return f
+
+
+def _exp_unavailable(x):
+    _unavailable("exp", "the engine's exp body is wrong on this board "
+                 "(measured max abs 2.5e5 vs CPU; COMPLETENESS.md); the "
+                 "verified device path is sigmoid-based, which only covers "
+                 "the non-positive range used inside softmax")
+
+
+def _log_unavailable(x):
+    _unavailable("log", "the engine's log body is wrong on this board "
+                 "(measured: NaN for 4081/4096 inputs; COMPLETENESS.md)")
+
+
+def _erf_unavailable(x):
+    _unavailable("erf", "the engine's erf body is wrong on this board "
+                 "(COMPLETENESS.md); gelu(approximate='tanh') is available")
+
+
+def _floor_unavailable(x):
+    _unavailable("floor", "the engine's floor kernel does not even generate "
+                 "in this kgen build (kops.py b_ceil/b_floor TypeError, then "
+                 "VC4_ERR_KERNEL); COMPLETENESS.md")
+
+
+def _ceil_unavailable(x):
+    _unavailable("ceil", "the engine's ceil kernel does not generate in this "
+                 "kgen build (kops.py b_ceil TypeError; VC4_ERR_KERNEL); "
+                 "COMPLETENESS.md")
+
+
+def _round_unavailable(x):
+    _unavailable("round", "the engine's round body is wrong on this board "
+                 "(measured max abs 12 vs CPU; COMPLETENESS.md)")
+
+
+# ------------------------------------------------------------ binary ops
+
+def _binary(a, b, op, alpha=1.0):
+    sa = _scalar_of(a)
+    sb = _scalar_of(b)
+    if sa is not None:
+        if op == "add":
+            return T.add_scalar(b, sa * alpha)
+        if op == "mul":
+            return T.mul_scalar(b, sa)
+        if op == "sub":
+            # scalar - tensor: materialise the scalar as a full tensor
+            return T.add_scalar(T.mul_scalar(b, -1.0), sa)
+        if op == "div":
+            return T.mul_scalar(reciprocal(b), sa)
+    if sb is not None:
+        if op == "add":
+            return T.add_scalar(a, sb * alpha)
+        if op == "mul":
+            return T.mul_scalar(a, sb)
+        if op == "sub":
+            return T.add_scalar(a, -sb * alpha)
+        if op == "div":
+            return T.mul_scalar(a, 1.0 / sb)
+    f32(b, op)
+    shape = torch.broadcast_shapes(tuple(a.shape), tuple(b.shape))
+    aa = _expand(a, shape)
+    bb = _expand(b, shape)
+    if op == "add":
+        if alpha == 1.0:
+            return T.add(aa, bb)
+        return T.add(aa, T.mul_scalar(bb, alpha))
+    if op == "sub":
+        return T.add(aa, T.mul_scalar(bb, -alpha))
+    if op == "mul":
+        return T.mul(aa, bb)
+    if op == "div":
+        return T.mul(aa, reciprocal(bb))
+    raise RuntimeError("torch_vc4: unknown binary op %r" % (op,))
+
+
+def _add_tensor(a, b, alpha=1):
+    return _binary(a, b, "add", float(alpha))
+
+
+def _sub_tensor(a, b, alpha=1):
+    return _binary(a, b, "sub", float(alpha))
+
+
+def _mul_tensor(a, b):
+    return _binary(a, b, "mul")
+
+
+def _div_tensor(a, b):
+    return _binary(a, b, "div")
 
 
 # ---------------------------------------------------------------- views
@@ -374,17 +905,28 @@ def cat(tensors, dim=0):
     for t in tensors:
         f32(t, "cat")
     t0 = tensors[0]
-    if t0.dim() == 4:
+    nd = t0.dim()
+    if nd == 4:
         if dim not in (1, -3):
             raise RuntimeError("torch_vc4: cat is implemented on the channel "
                                "axis of NCHW tensors (dim=1), got dim=%d" % dim)
-        parts = [t.view(t.shape[1], t.shape[2], t.shape[3]) for t in tensors]
-        y = T.cat_ch(parts)
-        return y.view(1, y.shape[0], y.shape[1], y.shape[2])
-    if t0.dim() == 3 and dim in (0, -3):
+        N = t0.shape[0]
+        for t in tensors:
+            if t.shape[0] != N or t.shape[2:] != t0.shape[2:]:
+                raise RuntimeError("torch_vc4: cat: shapes %s are not "
+                                   "compatible on the channel axis"
+                                   % [tuple(t.shape) for t in tensors])
+        parts = []
+        for n in range(N):
+            parts.append(T.cat_ch([t[n].view(t.shape[1], t.shape[2],
+                                             t.shape[3]) for t in tensors]))
+        y = T.cat_ch(parts) if N > 1 else parts[0]
+        C = sum(t.shape[1] for t in tensors)
+        return y.view(N, C, t0.shape[2], t0.shape[3])
+    if nd == 3 and dim in (0, -3):
         return T.cat_ch(list(tensors))
     raise RuntimeError("torch_vc4: cat: unsupported rank %d / dim %d"
-                       % (t0.dim(), dim))
+                       % (nd, dim))
 
 
 # --------------------------------------------------------------- resize
@@ -394,13 +936,13 @@ def upsample_nearest2d(x, output_size, scales_h=None, scales_w=None):
     if x.dim() != 4:
         raise RuntimeError("torch_vc4: upsample_nearest2d expects NCHW")
     N, C, H, W = x.shape
-    if N != 1:
-        raise RuntimeError("torch_vc4: upsample_nearest2d runs batch 1")
     ho, wo = int(output_size[0]), int(output_size[1])
-    y = T.up_nearest(x.view(C, H, W), ho, wo,
-                     float(scales_h) if scales_h else 0.0,
-                     float(scales_w) if scales_w else 0.0)
-    return y.view(1, C, ho, wo)
+    parts = [T.up_nearest(x[n], ho, wo,
+                          float(scales_h) if scales_h else 0.0,
+                          float(scales_w) if scales_w else 0.0)
+             for n in range(N)]
+    y = T.cat_ch(parts) if N > 1 else parts[0]
+    return y.view(N, C, ho, wo)
 
 
 def upsample_nearest2d_vec(x, output_size, scale_factors):
@@ -418,55 +960,90 @@ def upsample_nearest2d_vec(x, output_size, scale_factors):
 
 # --------------------------------------------------------------- batch norm
 
-def _bn(x, weight, bias, mean, var, training, eps, momentum, cudnn=False):
-    if training:
-        raise RuntimeError(
-            "torch_vc4: batch_norm is implemented in inference mode only "
-            "(running statistics); training-mode batch norm would need a "
-            "per-channel reduction kernel the engine does not have.  Use "
-            "module.eval() and fold the BN instead (see fold_bn_into_conv).")
-    f32(x, "batch_norm")
-    if mean is None or var is None:
-        raise RuntimeError("torch_vc4: batch_norm needs running_mean and "
-                           "running_var in inference mode")
+def _bn_apply(x, mean, var, weight, bias, eps):
+    """y = (x - mean) / sqrt(var + eps) * gamma + beta, all on device."""
+    N, C = x.shape[0], x.shape[1]
+    inv = T.rsqrt(T.add_scalar(var.view(C), eps))
+    scale = T.mul(inv, weight) if weight is not None else inv
+    shift = T.mul(scale, mean.view(C))
+    shift = T.mul_scalar(shift, -1.0)
+    if bias is not None:
+        f32(bias, "batch_norm(bias)")
+        shift = T.add(shift, bias)
+    sc = _expand(scale.view(1, C, 1, 1), x.shape)
+    sh = _expand(shift.view(1, C, 1, 1), x.shape)
+    return T.add(T.mul(x, sc), sh)
+
+
+def _bn_batch_stats(x):
+    """Per-channel mean and biased variance of NCHW, on device."""
+    N, C, H, W = x.shape
+    n = N * H * W
+    mean = _dims_reduce(x, [0, 2, 3], True, "sum")
+    mean = T.mul_scalar(mean, 1.0 / n)                       # [1,C,1,1]
+    d = T.add(x, T.mul_scalar(_expand(mean, x.shape), -1.0))
+    var = _dims_reduce(T.mul(d, d), [0, 2, 3], True, "sum")
+    var = T.mul_scalar(var, 1.0 / n)
+    return mean.view(C), var.view(C), d
+
+
+def _bn_update(running, batch, momentum):
+    newv = T.add(T.mul_scalar(running, 1.0 - momentum),
+                 T.mul_scalar(batch, momentum))
+    running.copy_(newv)
+
+
+def _bn_forward(x, weight, bias, mean, var, training, momentum, eps):
     if x.dim() != 4:
         raise RuntimeError("torch_vc4: batch_norm expects NCHW")
     N, C, H, W = x.shape
-    if N != 1:
-        raise RuntimeError("torch_vc4: batch_norm runs batch 1")
+    if training:
+        bmean, bvar, d = _bn_batch_stats(x)
+        invstd = T.rsqrt(T.add_scalar(bvar, eps))
+        xhat = T.mul(d, _expand(invstd.view(1, C, 1, 1), x.shape))
+        y = (T.mul(xhat, _expand(weight.view(1, C, 1, 1), x.shape))
+             if weight is not None else xhat)
+        if bias is not None:
+            y = T.add(y, _expand(bias.view(1, C, 1, 1), x.shape))
+        n = N * H * W
+        if mean is not None:
+            f32(mean, "batch_norm(running_mean)")
+            _bn_update(mean.view(C), bmean, momentum)
+        if var is not None:
+            f32(var, "batch_norm(running_var)")
+            unb = T.mul_scalar(bvar, n / (n - 1) if n > 1 else 1.0)
+            _bn_update(var.view(C), unb, momentum)
+        return y, bmean, invstd
+    if mean is None or var is None:
+        raise RuntimeError("torch_vc4: batch_norm needs running_mean and "
+                           "running_var in inference mode")
     f32(mean, "batch_norm(running_mean)")
     f32(var, "batch_norm(running_var)")
     if mean.numel() != C or var.numel() != C:
         raise RuntimeError("torch_vc4: batch_norm running stats have %d/%d "
                            "elements, expected %d" % (mean.numel(),
                                                       var.numel(), C))
-    # scale = gamma / sqrt(var + eps); shift = beta - mean * scale.
-    # Both vectors are C long and every elementwise op below is a QPU kernel;
-    # the only host work is broadcasting them to [C][H][W] (bytes).
-    v = T.add_scalar(var, eps) if eps else var
-    inv = T.rsqrt(v)
-    scale = T.mul(inv, weight) if weight is not None else inv
-    shift = T.mul(scale, mean)
-    shift = T.mul_scalar(shift, -1.0)
+    invstd = T.rsqrt(T.add_scalar(var.view(C), eps))
+    xhat = T.add(x, T.mul_scalar(_expand(mean.view(1, C, 1, 1), x.shape), -1.0))
+    xhat = T.mul(xhat, _expand(invstd.view(1, C, 1, 1), x.shape))
+    y = T.mul(xhat, _expand(weight.view(1, C, 1, 1), x.shape)) \
+        if weight is not None else xhat
     if bias is not None:
-        f32(bias, "batch_norm(bias)")
-        shift = T.add(shift, bias)
-    sb = T.bcast_ch(scale, H, W)
-    hb = T.bcast_ch(shift, H, W)
-    y = T.add(T.mul(x.view(C, H, W), sb), hb)
-    empty = torch.empty((0,), dtype=torch.float32, device=x.device)
-    return y.view(N, C, H, W), empty, empty
+        y = T.add(y, _expand(bias.view(1, C, 1, 1), x.shape))
+    return y, mean.view(C), invstd
 
 
 def native_batch_norm(x, weight, bias, mean, var, training, momentum, eps):
-    return _bn(x, weight, bias, mean, var, bool(training), float(eps),
-               float(momentum))
+    f32(x, "batch_norm")
+    y, bmean, invstd = _bn_forward(x, weight, bias, mean, var, bool(training),
+                                   float(momentum), float(eps))
+    return y, bmean, invstd
 
 
 def batch_norm(x, weight, bias, mean, var, training, momentum, eps,
                cudnn_enabled=False):
-    return _bn(x, weight, bias, mean, var, bool(training), float(eps),
-               float(momentum), bool(cudnn_enabled))[0]
+    return native_batch_norm(x, weight, bias, mean, var, training, momentum,
+                             eps)[0]
 
 
 # ---------------------------------------------------------------- linear
@@ -509,6 +1086,8 @@ def sum_all(t, dtype=None):
         raise RuntimeError("torch_vc4: sum(dtype=...) is not supported")
     flat = t.view(-1)
     n = flat.numel()
+    if n == 0:
+        raise RuntimeError("torch_vc4: sum of an empty tensor")
     if n <= _SUM_CHUNK:
         return T.sum_all(flat).view([])
     acc = None
@@ -518,17 +1097,221 @@ def sum_all(t, dtype=None):
     return acc.view([])
 
 
-def contiguous(t):
-    """A contiguous tensor with the same values (byte copy when needed)."""
-    f32(t, "contiguous")
-    return t if t.is_contiguous() else T.contiguous(t)
-
-
 def mean_all(t, dtype=None):
     f32(t, "mean")
     if t.numel() == 0:
         raise RuntimeError("torch_vc4: mean of an empty tensor")
     return T.mul_scalar(sum_all(t), 1.0 / t.numel())
+
+
+def sum_dims(t, dim, keepdim=False, dtype=None):
+    f32(t, "sum")
+    if dtype is not None and dtype != torch.float32:
+        raise RuntimeError("torch_vc4: sum(dtype=...) is not supported")
+    if dim is None or len(dim) == 0:
+        r = sum_all(t)
+        return r.view([1] * t.dim()) if keepdim else r
+    dims = _norm_dims(dim, t.dim(), "sum")
+    return _dims_reduce(t, dims, bool(keepdim), "sum")
+
+
+def mean_dims(t, dim, keepdim=False, dtype=None):
+    f32(t, "mean")
+    if dtype is not None and dtype != torch.float32:
+        raise RuntimeError("torch_vc4: mean(dtype=...) is not supported")
+    if dim is None or len(dim) == 0:
+        r = mean_all(t)
+        return r.view([1] * t.dim()) if keepdim else r
+    dims = _norm_dims(dim, t.dim(), "mean")
+    return _dims_reduce(t, dims, bool(keepdim), "mean")
+
+
+def amax_dims(t, dim=None, keepdim=False):
+    f32(t, "amax")
+    if dim is None or len(dim) == 0:
+        dims = list(range(t.dim()))
+    else:
+        dims = _norm_dims(dim, t.dim(), "amax")
+    return _dims_reduce(t, dims, bool(keepdim), "max")
+
+
+def amin_dims(t, dim=None, keepdim=False):
+    f32(t, "amin")
+    if dim is None or len(dim) == 0:
+        dims = list(range(t.dim()))
+    else:
+        dims = _norm_dims(dim, t.dim(), "amin")
+    return _dims_reduce(t, dims, bool(keepdim), "min")
+
+
+def _reshape_idx(r, shape):
+    """Reshape an int64 index result (the view kernel is float-only)."""
+    if tuple(r.shape) == tuple(shape):
+        return r
+    out = torch.empty(tuple(shape), dtype=torch.int64, device=r.device)
+    out.copy_(r.cpu().reshape(shape))
+    return out
+
+
+def argmax(t, dim=None, keepdim=False):
+    f32(t, "argmax")
+    nd = t.dim()
+    if dim is None:
+        flat = t.view(1, t.numel())
+        return _reshape_idx(T.argmax_host(flat, 1, t.numel(), True), ())
+    d = _norm_dim(dim, nd, "argmax")
+    perm = list(range(nd))
+    perm.append(perm.pop(d))
+    xp = t if d == nd - 1 else _permute_dims(t, perm)
+    cols = xp.shape[-1]
+    rows = xp.numel() // cols
+    r = T.argmax_host(xp.view(rows, cols), rows, cols, True)   # [rows] int64
+    keepshape = [t.shape[i] for i in range(nd) if i != d]
+    shape = keepshape if not keepdim else \
+        [1 if i == d else t.shape[i] for i in range(nd)]
+    return _reshape_idx(r, shape)
+
+
+def argmin(t, dim=None, keepdim=False):
+    f32(t, "argmin")
+    nd = t.dim()
+    if dim is None:
+        flat = t.view(1, t.numel())
+        return _reshape_idx(T.argmax_host(flat, 1, t.numel(), False), ())
+    d = _norm_dim(dim, nd, "argmin")
+    perm = list(range(nd))
+    perm.append(perm.pop(d))
+    xp = t if d == nd - 1 else _permute_dims(t, perm)
+    cols = xp.shape[-1]
+    rows = xp.numel() // cols
+    r = T.argmax_host(xp.view(rows, cols), rows, cols, False)
+    shape = ([1 if i == d else t.shape[i] for i in range(nd)] if keepdim
+             else [t.shape[i] for i in range(nd) if i != d])
+    return _reshape_idx(r, shape)
+
+
+def max_full(t):
+    return amax_dims(t, None, False)
+
+
+def min_full(t):
+    return amin_dims(t, None, False)
+
+
+def max_dim(t, dim, keepdim=False):
+    v = amax_dims(t, [dim], keepdim)
+    i = argmax(t, dim, keepdim)
+    return v, i
+
+
+def min_dim(t, dim, keepdim=False):
+    v = amin_dims(t, [dim], keepdim)
+    i = argmin(t, dim, keepdim)
+    return v, i
+
+
+# -------------------------------------------------------------- indexing
+
+def _index_host(index, what):
+    """Indices are bookkeeping: keep them on the host (a byte copy), never on
+    the QPU.  The vc4 allocator has no int64 gather, and a 64-bit index tensor
+    is never a compute operand."""
+    if index.dtype != torch.int64:
+        raise RuntimeError("torch_vc4: %s index must be int64, got %s"
+                           % (what, index.dtype))
+    if index.device.type == "vc4":
+        if not index.is_contiguous():
+            raise RuntimeError("torch_vc4: %s index must be contiguous"
+                               % what)
+        index = index.cpu()
+    return index.contiguous()
+
+
+def gather(x, dim, index, sparse_grad=False):
+    """out[i][j] = x[...][index[i][j]][...] (exact, host word gather).
+
+    PyTorch's gather semantics: the index shape is the output shape, the
+    index size along each non-gathered axis may only shrink the source
+    (a prefix is read), and index.select's per-row broadcast is not involved.
+    """
+    f32(x, "gather")
+    index = _index_host(index, "gather")
+    nd = x.dim()
+    d = _norm_dim(dim, nd, "gather")
+    if index.dim() != nd:
+        raise RuntimeError("torch_vc4: gather index rank %d != source rank %d"
+                           % (index.dim(), nd))
+    sizes = list(x.shape)
+    for i in range(nd):
+        if i == d:
+            continue
+        if index.shape[i] > x.shape[i]:
+            raise RuntimeError(
+                "torch_vc4: gather: index dim %d is %d > source %d"
+                % (i, index.shape[i], x.shape[i]))
+        sizes[i] = index.shape[i]
+    if sizes != list(x.shape):
+        v = T.as_strided_alias(x, sizes, [x.stride(i) for i in range(nd)],
+                               x.storage_offset())
+        x = T.materialize(v)
+    perm = [d] + [i for i in range(nd) if i != d]
+    xp = _permute_dims(x, perm) if perm != list(range(nd)) else x
+    ip = index.permute(perm).contiguous() if perm != list(range(nd)) else index
+    D = xp.shape[0]
+    rest = xp.numel() // D
+    B = index.shape[d]
+    out2 = T.take(xp.view(D, rest), ip.view(B, rest), rest)
+    out = out2.view([B] + [sizes[i] for i in perm[1:]])
+    inv = [0] * nd
+    for i, p in enumerate(perm):
+        inv[p] = i
+    if inv != list(range(nd)):
+        out = _permute_dims(out, inv)
+    return out
+
+
+def index_select(x, dim, index):
+    """out[..., i, ...] = x[..., index[i], ...] (same index for every row)."""
+    f32(x, "index_select")
+    if index.dim() != 1:
+        raise RuntimeError("torch_vc4: index_select expects a 1-D index")
+    index = _index_host(index, "index_select")
+    nd = x.dim()
+    d = _norm_dim(dim, nd, "index_select")
+    perm = [d] + [i for i in range(nd) if i != d]
+    xp = _permute_dims(x, perm) if perm != list(range(nd)) else x
+    D = x.shape[d]
+    rest = x.numel() // D
+    B = index.numel()
+    out2 = T.take(xp.view(D, rest), index, rest)       # row mode
+    out = out2.view([B] + [x.shape[i] for i in perm[1:]])
+    inv = [0] * nd
+    for i, p in enumerate(perm):
+        inv[p] = i
+    if inv != list(range(nd)):
+        out = _permute_dims(out, inv)
+    return out
+
+
+def _scatter_raise(name):
+    def f(*a, **k):
+        raise RuntimeError(
+            "torch_vc4: %s is unsupported on this backend: there is no "
+            "scatter kernel (the engine's table-driven vc4_gather only reads, "
+            "and it hangs on this board), and a host scatter would be a CPU "
+            "fallback. Rewrite the model without scatter or run it on CPU."
+            % name)
+    return f
+
+
+def _sort_raise(name):
+    def f(*a, **k):
+        raise RuntimeError(
+            "torch_vc4: %s is unsupported on this backend: there is no QPU "
+            "sort/selection kernel in this engine build; a host sort would be "
+            "a full CPU fallback, which this backend does not do."
+            % name)
+    return f
 
 
 # ------------------------------------------------------------- fold helper
@@ -551,6 +1334,15 @@ def fold_bn_into_conv(weight, bias, mean, var, gamma, beta, eps=1e-5):
 
 # ------------------------------------------------------------- registration
 
+def _scalar_of(x):
+    """The Python value of a scalar operand (Python number or CPU 0-dim)."""
+    if isinstance(x, (int, float)):
+        return float(x)
+    if torch.is_tensor(x) and x.device.type == "cpu" and x.numel() == 1:
+        return float(x)
+    return None
+
+
 def register():
     # torch deregisters a Library when it is collected; keep it alive
     lib = _keep(torch.library.Library("aten", "IMPL", "PrivateUse1"))
@@ -568,6 +1360,20 @@ def register():
     impl("_softmax", softmax)
     impl("sigmoid", sigmoid)
     impl("silu", silu)
+    impl("tanh", tanh)
+    impl("sqrt", sqrt)
+    impl("abs", unary_abs)
+    impl("sign", unary_sign)
+    impl("clip", unary_clip)
+    impl("leaky_relu", unary_leaky_relu)
+    impl("hardsigmoid", unary_hardsigmoid)
+    impl("hardswish", unary_hardswish)
+    impl("gelu", gelu)
+    impl("reciprocal", reciprocal)
+    for _n, _f in (("exp", _exp_unavailable), ("log", _log_unavailable),
+                   ("erf", _erf_unavailable), ("floor", _floor_unavailable),
+                   ("ceil", _ceil_unavailable), ("round", _round_unavailable)):
+        impl(_n, _f)
     # aten::view/aten::as_strided are registered natively (csrc) -- the
     # Python layer only supplies the autograd Functions for them.
     impl("flatten.using_ints", flatten)
@@ -579,8 +1385,35 @@ def register():
     impl("linear", linear)
     impl("sum", sum_all)
     impl("mean", mean_all)
-    # (the Tensor overloads above are re-registered here so that a scalar
-    # operand in the *second* position never reaches the two-tensor kernels)
+    impl("sum.dim_IntList", sum_dims)
+    impl("mean.dim", mean_dims)
+    impl("amax", amax_dims)
+    impl("amin", amin_dims)
+    impl("argmax", argmax)
+    impl("argmin", argmin)
+    impl("max", max_full)
+    impl("min", min_full)
+    impl("max.dim", max_dim)
+    impl("min.dim", min_dim)
+    impl("gather", gather)
+    impl("index_select", index_select)
+    def impl_safe(name, fn):
+        # the overload name has to exist in this torch build; an unknown one
+        # would make importing the backend fail for no good reason
+        try:
+            lib.impl(name, fn)
+        except Exception:
+            pass
+
+    for _n in ("scatter", "scatter.value", "scatter_", "scatter_.value",
+               "scatter_add", "scatter_add_", "index_add", "index_add_"):
+        impl_safe(_n, _scatter_raise(_n))
+    for _n in ("sort", "sort.stable", "topk", "kthvalue", "median",
+               "median.dim", "unique", "unique_dim"):
+        impl_safe(_n, _sort_raise(_n))
+    # scalar overloads; the Tensor overloads re-register here so that a
+    # scalar operand in the *second* position never reaches a two-tensor
+    # kernel
     impl("mul.Scalar", lambda x, s: T.mul_scalar(x, float(s)))
     impl("div.Scalar", lambda x, s: T.mul_scalar(x, 1.0 / float(s)))
     impl("div.Tensor", _div_tensor)
@@ -596,55 +1429,6 @@ def register():
     return lib
 
 
-def _is_cpu_scalar(t):
-    return torch.is_tensor(t) and t.device.type == "cpu" and t.numel() == 1
-
-
-def _scalar_of(x):
-    """The Python value of a scalar operand (Python number or CPU 0-dim)."""
-    if isinstance(x, (int, float)):
-        return float(x)
-    if _is_cpu_scalar(x):
-        return float(x)
-    return None
-
-
-def _div_tensor(a, b):
-    """x / s is one GPU multiply by 1/s; x / y on device has no kernel."""
-    f32(a, "div")
-    s = _scalar_of(b)
-    if s is not None:
-        return T.mul_scalar(a, 1.0 / s)
-    raise RuntimeError(
-        "torch_vc4: division of two device tensors is not implemented (the "
-        "engine has no reciprocal-divide kernel); divide by a host scalar or "
-        "multiply by a precomputed reciprocal tensor on the CPU")
-
-
-def _add_tensor(a, b, alpha=1):
-    f32(a, "add")
-    s = _scalar_of(b)
-    if s is not None:
-        return T.add_scalar(a, s * float(alpha))
-    return T.add(a, b, alpha)
-
-
-def _mul_tensor(a, b):
-    f32(a, "mul")
-    s = _scalar_of(b)
-    if s is not None:
-        return T.mul_scalar(a, s)
-    return T.mul(a, b)
-
-
-def _sub_tensor(a, b, alpha=1):
-    f32(a, "sub")
-    s = _scalar_of(b)
-    if s is not None:
-        return T.add_scalar(a, -s * float(alpha))
-    return T.add(a, T.mul_scalar(b, -float(alpha)))
-
-
 def _add_inplace(self, other, alpha=1):
     """p.add_(g, alpha) for the autograd engine's gradient accumulation."""
     out = _add_scalar_alpha(self, other, alpha)
@@ -654,21 +1438,20 @@ def _add_inplace(self, other, alpha=1):
 
 def _add_scalar_alpha(a, b, alpha):
     f32(a, "add_")
+    shape = torch.broadcast_shapes(tuple(a.shape), tuple(b.shape))
+    bb = _expand(b, shape)
+    if shape != tuple(a.shape):
+        raise RuntimeError("torch_vc4: add_ cannot broadcast into a different "
+                           "shape (%s -> %s)" % (tuple(a.shape), shape))
     if alpha == 1:
-        return T.add(a, b)
-    return T.add(a, T.mul_scalar(b, float(alpha)))
+        return T.add(a, bb)
+    return T.add(a, T.mul_scalar(bb, float(alpha)))
 
 
 def convolution_backward(g, x, w, stride, pad, dil, transposed, out_pad,
                         groups, output_mask):
     """The backward hook torch's own conv autograd calls for custom backends
     (``aten::convolution_backward_overrideable``).
-
-    The whole convolution family in torch funnels through
-    ``aten::_convolution``, whose generated autograd node asks the backend for
-    ``convolution_backward_overrideable``.  Serving it means ``F.conv2d`` and
-    ``nn.Conv2d`` train through the standard torch autograd engine, with the
-    engine's dX/dW kernels underneath.
     """
     if transposed:
         raise RuntimeError("torch_vc4: transposed conv backward is not "
@@ -686,8 +1469,7 @@ def convolution_backward(g, x, w, stride, pad, dil, transposed, out_pad,
         dx = dx_ if want_x else None
         dw = dw_ if want_w else None
     if want_b:
-        c, ho, wo = g.shape[1], g.shape[2], g.shape[3]
-        db = channel_sums(g.view(c, ho, wo))
+        db = _dims_reduce(g, [0, 2, 3], False, "sum")
     return dx, dw, db
 
 

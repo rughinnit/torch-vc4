@@ -21,7 +21,7 @@ extra_objects = [
 
 setup(
     name="torch_vc4",
-    version="0.2.0",
+    version="0.3.0",
     description="Subset PyTorch PrivateUse1 backend for VideoCore IV (VC4)",
     packages=["torch_vc4"],
     ext_modules=[

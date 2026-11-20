@@ -390,9 +390,12 @@ static at::Tensor vc4_empty(c10::IntArrayRef size,
                 device ? device->str() : std::string("<none>"));
     const at::ScalarType want = dtype ? *dtype : at::kFloat;
     TORCH_CHECK(want == at::kFloat || want == at::kLong,
-                "torch_vc4: only float32 tensors are supported (int64 is "
-                "accepted for bookkeeping buffers, e.g. batch-norm counters), "
-                "got ", c10::toString(want));
+                "torch_vc4: ", c10::toString(want), " is unsupported by "
+                "design: the VideoCore IV QPU and every engine kernel are "
+                "float32-only (int64 is accepted for index/bookkeeping "
+                "buffers only).  Emulating float64 would double storage and "
+                "add conversion launches instead of computing in fp64, so it "
+                "is rejected rather than silently downgraded.");
     TORCH_CHECK(!layout || *layout == at::kStrided,
                 "torch_vc4: only strided layout is supported");
     TORCH_CHECK(!pin_memory || !*pin_memory,
@@ -1851,6 +1854,348 @@ static at::Tensor &vc4_uniform_(at::Tensor &self, double from, double to,
     return self;
 }
 
+
+/* ======================================================================
+ * Part 3: batches, arbitrary-dim reductions, softmax for any class count and
+ * the verified unary subset.
+ *
+ * IMPORTANT, measured on this board: the engine's generic kernels
+ * `vc4_reduce` and `vc4_gather` are linked in libvc4infer.a but HANG the GPU
+ * in this build -- every call returns VC4_ERR_TIMEOUT (-4) and kills the
+ * context.  Nothing below calls them.  Reductions are GEMMs (sum/mean) or a
+ * relu/sign max tree (amax/amin); gather/index_select are a host word gather
+ * (a pure copy, exactly like contiguous()); argmax is a host integer scan.
+ * COMPLETENESS.md records this with the measured status codes.
+ * ====================================================================== */
+
+/* int64 tensors are index bookkeeping, never compute: the allocator and the
+ * upload path handle them, the kernels never see them. */
+static std::vector<int64_t> host_get_i64(const at::Tensor &t)
+{
+    TORCH_CHECK(t.scalar_type() == at::kLong,
+                "torch_vc4: expected an int64 index tensor, got ",
+                t.scalar_type());
+    int64_t n = t.numel();
+    std::vector<int64_t> v((size_t)n);
+    if (!n)
+        return v;
+    if (t.device().type() == at::kCPU) {
+        TORCH_CHECK(t.is_contiguous(), "torch_vc4: index tensor must be "
+                    "contiguous");
+        memcpy(v.data(), t.const_data_ptr(), (size_t)n * 8);
+        return v;
+    }
+    TORCH_CHECK(t.device().type() == kDev, "torch_vc4: index tensor must be "
+                "on vc4 or the CPU");
+    TORCH_CHECK(t.is_contiguous(), "torch_vc4: index tensor must be contiguous");
+    ensure_init();
+    State &s = state();
+    std::lock_guard<std::mutex> g(s.gpu_mu);
+    vc4_buf b = buf_of(t);
+    vc4_status st = vc4_download(s.ctx, &b, v.data(), (size_t)n * 8);
+    if (st != VC4_OK)
+        throw_st(st, "index download");
+    return v;
+}
+
+static at::Tensor host_put_i64(c10::IntArrayRef sizes, const int64_t *src,
+                               size_t n)
+{
+    auto t = make_arena_tensor_dtype(sizes, at::kLong);
+    if (n) {
+        TORCH_CHECK(n == (size_t)t.numel(), "torch_vc4: internal size mismatch");
+        ensure_init();
+        State &s = state();
+        std::lock_guard<std::mutex> g(s.gpu_mu);
+        vc4_buf b = buf_of(t);
+        vc4_status st = vc4_upload(s.ctx, &b, src, n * 8);
+        if (st != VC4_OK)
+            throw_st(st, "index upload");
+    }
+    return t;
+}
+
+/* out = f(a), the engine's vc4_unary family.  Only the ops the Python layer
+ * has measured correct on the board are routed here (see COMPLETENESS.md):
+ * abs/neg/sign/clip/leakyrelu/hardsigmoid/hardswish.  The other bodies in
+ * this engine build return wrong numbers, so the Python layer refuses them. */
+static at::Tensor vc4_unary_op(const at::Tensor &a, int64_t op, double p0,
+                               double p1, double p2)
+{
+    ensure_init();
+    check_vc4_f32(a, "unary");
+    TORCH_CHECK(a.is_contiguous(), "torch_vc4: unary needs a contiguous tensor");
+    auto out = make_arena_tensor(a.sizes());
+    size_t n = (size_t)a.numel();
+    if (!n)
+        return out;
+    State &s = state();
+    std::lock_guard<std::mutex> g(s.gpu_mu);
+    vc4_buf ba = buf_of(a), bo = buf_of(out);
+    vc4_status st = vc4_unary(s.ctx, (vc4_uop)op, &ba, &bo, n, (float)p0,
+                              (float)p1, (float)p2);
+    if (st != VC4_OK)
+        throw_st(st, "unary");
+    return out;
+}
+
+/* ------------------------------------------------------------ NHWC conv */
+
+/* NCHW [N][C][H][W] -> NHWC [N][H][W][cpad]; channels C..cpad-1 are zero.
+ * A byte permutation on the ARM (no arithmetic), the layout the engine's
+ * batched/stride-2/depthwise NHWC kernels read. */
+static at::Tensor vc4_nhwc_pack(const at::Tensor &x, int64_t cpad)
+{
+    ensure_init();
+    check_vc4_f32(x, "conv2d(nhwc pack)");
+    TORCH_CHECK(x.dim() == 4 && x.is_contiguous(),
+                "torch_vc4: nhwc_pack expects contiguous NCHW");
+    int64_t N = x.size(0), C = x.size(1), H = x.size(2), W = x.size(3);
+    TORCH_CHECK(cpad >= C, "torch_vc4: nhwc_pack: cpad ", cpad, " < C ", C);
+    std::vector<float> src = host_get(x);
+    std::vector<float> dst((size_t)N * H * W * cpad, 0.0f);
+    for (int64_t n = 0; n < N; ++n)
+        for (int64_t y = 0; y < H; ++y)
+            for (int64_t xx = 0; xx < W; ++xx) {
+                const float *sp = src.data() +
+                    ((size_t)n * C * H * W + (size_t)y * W + xx);
+                float *dp = dst.data() +
+                    (((size_t)n * H + y) * W + xx) * cpad;
+                for (int64_t c = 0; c < C; ++c)
+                    dp[c] = sp[(size_t)c * H * W];
+            }
+    return host_put({N, H, W, cpad}, dst.data(), dst.size());
+}
+
+/* NHWC [N][H][pitch][Cp] -> NCHW [N][C][H][W] (drops channels C..Cp-1 and
+ * the pitch padding columns).  Byte permutation only. */
+static at::Tensor vc4_nhwc_unpack(const at::Tensor &y, int64_t N, int64_t C,
+                                  int64_t H, int64_t W)
+{
+    ensure_init();
+    check_vc4_f32(y, "conv2d(nhwc unpack)");
+    TORCH_CHECK(y.dim() == 4 && y.is_contiguous(),
+                "torch_vc4: nhwc_unpack expects contiguous NHWC");
+    int64_t pitch = y.size(2), Cp = y.size(3);
+    TORCH_CHECK(y.size(0) == N && y.size(1) == H && Cp >= C && pitch >= W,
+                "torch_vc4: nhwc_unpack shape ", y.sizes(), " vs N=", N,
+                " C=", C, " H=", H, " W=", W);
+    std::vector<float> src = host_get(y);
+    std::vector<float> dst((size_t)N * C * H * W);
+    for (int64_t n = 0; n < N; ++n)
+        for (int64_t c = 0; c < C; ++c)
+            for (int64_t yy = 0; yy < H; ++yy)
+                for (int64_t xx = 0; xx < W; ++xx)
+                    dst[(((size_t)n * C + c) * H + yy) * W + xx] =
+                        src[(((size_t)n * H + yy) * pitch + xx) * Cp + c];
+    return host_put({N, C, H, W}, dst.data(), dst.size());
+}
+
+/* Pack [Cout][Cin][KH][KW] (+ optional [Cout] bias) into the engine's GEMM
+ * weight panel.  The engine does the ci-major -> tap-major permutation. */
+static at::Tensor vc4_conv_nhwc_pack_w_op(const at::Tensor &wt,
+                                          const std::optional<at::Tensor> &bias,
+                                          int64_t cin, int64_t cout)
+{
+    ensure_init();
+    check_vc4_f32(wt, "conv2d(weight pack)");
+    TORCH_CHECK(wt.dim() == 4 && wt.is_contiguous(),
+                "torch_vc4: conv weight must be a contiguous 4-D tensor");
+    int64_t KH = wt.size(2), KW = wt.size(3);
+    TORCH_CHECK(wt.size(0) == cout && wt.size(1) == cin,
+                "torch_vc4: weight is ", wt.sizes(), ", expected [", cout,
+                "][", cin, "][", KH, "][", KW, "]");
+    size_t bytes = vc4_conv_nhwc_wpanel_bytes((int)cin, (int)cout, (int)KH,
+                                              (int)KW, bias ? 1 : 0);
+    TORCH_CHECK(bytes > 0, "torch_vc4: conv weight panel needs Cin%16==0 and "
+                "Cout%16==0, got ", cin, " and ", cout);
+    auto panel = make_arena_tensor({(int64_t)(bytes / 4)});
+    vc4_buf bb{};
+    const vc4_buf *pbb = nullptr;
+    if (bias) {
+        check_vc4_f32(*bias, "conv2d(bias pack)");
+        TORCH_CHECK(bias->dim() == 1 && bias->numel() == cout &&
+                    bias->is_contiguous(),
+                    "torch_vc4: conv bias must be [", cout, "]");
+    }
+    State &s = state();
+    std::lock_guard<std::mutex> g(s.gpu_mu);
+    vc4_buf bw = buf_of(wt), bp = buf_of(panel);
+    if (bias) {
+        bb = buf_of(*bias);
+        pbb = &bb;
+    }
+    vc4_status st = vc4_conv_nhwc_pack_w(s.ctx, &bw, (int)cin, (int)cout,
+                                         (int)KH, (int)KW, pbb, &bp);
+    if (st != VC4_OK)
+        throw_st(st, "conv2d weight pack");
+    return panel;
+}
+
+/* out = conv(in) over the whole batch, in NHWC.  Returns
+ * [nimg][ho][align16(wo)][Cout] (the engine's padded output pitch). */
+static at::Tensor vc4_conv_nhwc_op(const at::Tensor &in,
+                                   const at::Tensor &panel, int64_t nimg,
+                                   int64_t cin, int64_t H, int64_t W,
+                                   int64_t cout, int64_t KH, int64_t KW,
+                                   int64_t stride, int64_t pad, int64_t dil)
+{
+    ensure_init();
+    check_vc4_f32(in, "conv2d(nhwc)");
+    check_vc4_f32(panel, "conv2d(wpanel)");
+    TORCH_CHECK(in.dim() == 4 && in.is_contiguous(),
+                "torch_vc4: conv2d(nhwc) expects contiguous NHWC");
+    TORCH_CHECK(in.size(0) == nimg && in.size(1) == H && in.size(2) == W &&
+                in.size(3) == cin,
+                "torch_vc4: conv2d(nhwc) input ", in.sizes(), " != [", nimg,
+                "][", H, "][", W, "][", cin, "]");
+    int64_t effh = (KH - 1) * dil + 1, effw = (KW - 1) * dil + 1;
+    int64_t ho = (H + 2 * pad - effh) / stride + 1;
+    int64_t wo = (W + 2 * pad - effw) / stride + 1;
+    TORCH_CHECK(ho > 0 && wo > 0, "torch_vc4: conv2d: empty output");
+    int64_t Wg = (wo + 15) & ~int64_t(15);
+    auto out = make_arena_tensor({nimg, ho, Wg, cout});
+    State &s = state();
+    std::lock_guard<std::mutex> g(s.gpu_mu);
+    vc4_buf bi = buf_of(in), bp = buf_of(panel), bo = buf_of(out);
+    int gho = 0, gwo = 0, op = 0;
+    vc4_status st = vc4_conv_nhwc_dil(s.ctx, &bi, (int)nimg, (int)cin, (int)H,
+                                      (int)W, (int)W, &bp, (int)cout, (int)KH,
+                                      (int)KW, (int)stride, (int)pad,
+                                      (int)dil, &bo, &gho, &gwo, &op);
+    if (st != VC4_OK)
+        throw_st(st, "conv2d(nhwc)");
+    TORCH_CHECK(gho == ho && gwo == wo, "torch_vc4: conv2d nhwc size drift");
+    return out;
+}
+
+/* 3x3 depthwise panel: [C][1][3][3] -> engine block-diagonal panel, with the
+ * channel count padded to a multiple of 16 (zero weights). */
+static at::Tensor vc4_depthwise_panel(const at::Tensor &w, int64_t cpad)
+{
+    ensure_init();
+    check_vc4_f32(w, "conv2d(depthwise weight)");
+    TORCH_CHECK(w.dim() == 4 && w.size(1) == 1 && w.size(2) == 3 &&
+                w.size(3) == 3 && w.is_contiguous(),
+                "torch_vc4: depthwise weight must be [C][1][3][3]");
+    int64_t C = w.size(0);
+    TORCH_CHECK(cpad >= C && cpad % 16 == 0,
+                "torch_vc4: depthwise channel pad must be a multiple of 16");
+    std::vector<float> src = host_get(w);
+    std::vector<float> dst((size_t)cpad * 9, 0.0f);
+    memcpy(dst.data(), src.data(), (size_t)C * 9 * sizeof(float));
+    auto wt = host_put({cpad, 1, 3, 3}, dst.data(), dst.size());
+    size_t bytes = vc4_depthwise_wpanel_bytes((int)cpad);
+    TORCH_CHECK(bytes > 0, "torch_vc4: depthwise panel size");
+    auto panel = make_arena_tensor({(int64_t)(bytes / 4)});
+    State &s = state();
+    std::lock_guard<std::mutex> g(s.gpu_mu);
+    vc4_buf bw = buf_of(wt), bp = buf_of(panel);
+    vc4_status st = vc4_depthwise_pack_w(s.ctx, &bw, (int)cpad, &bp);
+    if (st != VC4_OK)
+        throw_st(st, "conv2d depthwise pack");
+    return panel;
+}
+
+/* 3x3 stride-1 pad-1 depthwise, NHWC, whole batch. */
+static at::Tensor vc4_depthwise_nhwc_op(const at::Tensor &in,
+                                        const at::Tensor &panel, int64_t nimg,
+                                        int64_t C, int64_t H, int64_t W)
+{
+    ensure_init();
+    check_vc4_f32(in, "conv2d(depthwise)");
+    TORCH_CHECK(in.dim() == 4 && in.is_contiguous() && in.size(3) == C &&
+                in.size(0) == nimg && in.size(1) == H && in.size(2) == W,
+                "torch_vc4: depthwise expects NHWC [N][H][W][C]");
+    int64_t Wg = (W + 15) & ~int64_t(15);
+    auto out = make_arena_tensor({nimg, H, Wg, C});
+    State &s = state();
+    std::lock_guard<std::mutex> g(s.gpu_mu);
+    vc4_buf bi = buf_of(in), bp = buf_of(panel), bo = buf_of(out);
+    int gho = 0, gwo = 0, op = 0;
+    vc4_status st = vc4_depthwise_nhwc(s.ctx, &bi, (int)nimg, (int)C, (int)H,
+                                       (int)W, (int)W, &bp, &bo, &gho, &gwo,
+                                       &op);
+    if (st != VC4_OK)
+        throw_st(st, "conv2d(depthwise)");
+    TORCH_CHECK(gho == H && gwo == W, "torch_vc4: depthwise size drift");
+    return out;
+}
+
+/* ------------------------------------------------------- index selection */
+
+/* out[b][r] = src[row][r], where row = idx[b] (idx 1-D) or idx[b][r]
+ * (idx 2-D with idx.size(1) == rest).  A host word gather: index arithmetic
+ * plus memcpy, no floating-point arithmetic.  This is the layout primitive
+ * gather/index_select are built from (vc4_gather hangs, see above). */
+static at::Tensor vc4_take_host(const at::Tensor &src, const at::Tensor &idx,
+                                int64_t rest)
+{
+    ensure_init();
+    check_vc4_f32(src, "gather(source)");
+    TORCH_CHECK(src.is_contiguous(), "torch_vc4: gather needs a contiguous "
+                "source");
+    TORCH_CHECK(rest > 0 && src.numel() % rest == 0,
+                "torch_vc4: gather: rest ", rest, " does not divide ",
+                src.numel());
+    int64_t A = src.numel() / rest;
+    TORCH_CHECK(idx.dim() == 1 || (idx.dim() == 2 && idx.size(1) == rest),
+                "torch_vc4: gather index must be 1-D or [B][", rest, "], got ",
+                idx.sizes());
+    std::vector<int64_t> ii = host_get_i64(idx);
+    int64_t B = idx.dim() == 1 ? idx.numel() : idx.size(0);
+    std::vector<float> s = host_get(src);
+    std::vector<float> out((size_t)B * rest);
+    for (int64_t b = 0; b < B; ++b)
+        for (int64_t r = 0; r < rest; ++r) {
+            int64_t row = idx.dim() == 1 ? ii[(size_t)b]
+                                         : ii[(size_t)b * rest + r];
+            if (row < 0)
+                row += A;
+            TORCH_CHECK(row >= 0 && row < A, "torch_vc4: gather index ", row,
+                        " is outside [0, ", A, ")");
+            out[(size_t)b * rest + r] = s[(size_t)row * rest + r];
+        }
+    if (idx.dim() == 1)
+        return host_put({B, rest}, out.data(), out.size());
+    return host_put({B, rest}, out.data(), out.size());
+}
+
+/* argmax/argmin over [outer][red]: an integer scan on the ARM.  There is no
+ * working device arg-reduction in this engine build (vc4_reduce hangs); the
+ * scan only compares already-computed values and returns indices. */
+static at::Tensor vc4_arg_host(const at::Tensor &a, int64_t outer,
+                               int64_t red, bool is_max)
+{
+    ensure_init();
+    check_vc4_f32(a, "argmax/argmin");
+    TORCH_CHECK(a.is_contiguous(), "torch_vc4: argmax needs a contiguous "
+                "tensor");
+    TORCH_CHECK(outer > 0 && red > 0 && a.numel() == outer * red,
+                "torch_vc4: argmax: shape ", a.sizes(), " != ", outer, "x",
+                red);
+    std::vector<float> v = host_get(a);
+    std::vector<int64_t> idx((size_t)outer, 0);
+    for (int64_t o = 0; o < outer; ++o) {
+        int64_t best = 0;
+        for (int64_t r = 1; r < red; ++r) {
+            float x = v[(size_t)o * red + r];
+            float bst = v[(size_t)o * red + best];
+            bool take;
+            if (std::isnan(x))
+                take = !std::isnan(bst);
+            else if (std::isnan(bst))
+                take = false;
+            else
+                take = is_max ? (x > bst) : (x < bst);
+            if (take)
+                best = r;
+        }
+        idx[(size_t)o] = best;
+    }
+    return host_put_i64({outer}, idx.data(), idx.size());
+}
+
 /* ---------------------------------------------------------------- fallback */
 
 static void vc4_fallback(const c10::OperatorHandle &op, c10::DispatchKeySet,
@@ -2061,4 +2406,24 @@ TORCH_LIBRARY(torch_vc4, m)
           &torch_vc4::vc4_mul_scalar);
     m.def("add_scalar(Tensor t, float s) -> Tensor",
           &torch_vc4::vc4_add_scalar);
+    m.def("unary(Tensor t, int op, float p0, float p1, float p2) -> Tensor",
+          &torch_vc4::vc4_unary_op);
+    m.def("materialize(Tensor t) -> Tensor", &torch_vc4::vc4_materialize);
+    m.def("nhwc_pack(Tensor t, int cpad) -> Tensor",
+          &torch_vc4::vc4_nhwc_pack);
+    m.def("nhwc_unpack(Tensor t, int n, int c, int h, int w) -> Tensor",
+          &torch_vc4::vc4_nhwc_unpack);
+    m.def("conv_nhwc_pack_w(Tensor w, Tensor? bias, int cin, int cout) "
+          "-> Tensor", &torch_vc4::vc4_conv_nhwc_pack_w_op);
+    m.def("conv_nhwc(Tensor src, Tensor panel, int nimg, int cin, int h, "
+          "int w, int cout, int kh, int kw, int stride, int pad, int dil) "
+          "-> Tensor", &torch_vc4::vc4_conv_nhwc_op);
+    m.def("depthwise_panel(Tensor w, int cpad) -> Tensor",
+          &torch_vc4::vc4_depthwise_panel);
+    m.def("depthwise_nhwc(Tensor src, Tensor panel, int nimg, int c, int h, "
+          "int w) -> Tensor", &torch_vc4::vc4_depthwise_nhwc_op);
+    m.def("take(Tensor src, Tensor idx, int rest) -> Tensor",
+          &torch_vc4::vc4_take_host);
+    m.def("argmax_host(Tensor t, int outer, int red, bool is_max) -> Tensor",
+          &torch_vc4::vc4_arg_host);
 }

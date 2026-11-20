@@ -6,10 +6,13 @@ Usage:
     x = torch.randn(256, 256, device=torch_vc4.device())
     y = x @ x
 
-A small but usable subset exists on the device: gemm/linear, conv2d, pools,
-softmax, nearest resize, elementwise ops, inference-mode batch norm, views,
-and autograd for the training path (see README.md for the op table and its
-constraints).  Anything else raises instead of falling back to the CPU.
+A usable subset exists on the device: gemm/linear, conv2d (batched, stride
+1/2, depthwise), pools, softmax for any class count, nearest resize,
+elementwise/unary ops, broadcasting, arbitrary-dim reductions, indexing,
+batch norm (eval and training), views, and autograd for the training path.
+Anything else raises instead of falling back to the CPU; COMPLETENESS.md is
+the op table with measured accuracy and timings, and the exact reason for
+every raise.
 
 Note on the device string: this backend renames PrivateUse1 to "vc4", and
 tensors report `device('vc4')`, but torch 2.15's device-string *parser* was
@@ -140,6 +143,25 @@ from . import autograd as _autograd  # noqa: E402
 _ops.register()
 _autograd.register()
 
+# torch 2.15 decomposes aten::cat at CompositeImplicitAutograd before the
+# backend's Autograd kernel is consulted, which silently drops the graph node
+# for a PrivateUse1 tensor.  Serve the differentiable path explicitly for vc4
+# inputs; everything else goes to the original torch.cat unchanged.
+_cat_orig = _torch.cat
+
+
+def _cat(tensors, dim=0, *, out=None):
+    ts = list(tensors)
+    if (out is None and ts and all(t.device.type == "vc4" for t in ts)
+            and any(t.requires_grad for t in ts)):
+        return _autograd.CatFn.apply(int(dim), *ts)
+    if out is None:
+        return _cat_orig(tensors, dim)
+    return _cat_orig(tensors, dim, out=out)
+
+
+_torch.cat = _cat
+
 mse_loss = _autograd.mse_loss
 fold_bn_into_conv = _ops.fold_bn_into_conv
 adaptive_matrix = _ops.adaptive_matrix
@@ -148,9 +170,9 @@ SUPPORTED_OPS = (
     # memory / transfer
     "aten::empty.memory_format",
     "aten::empty_strided",
-    "aten::copy_ (and Tensor.to/.cpu for f32, same shape)",
+    "aten::copy_ (and Tensor.to/.cpu for f32/int64, same shape)",
     "aten::fill_.Scalar, aten::zero_",
-    "aten::normal_ (host RNG, uploaded)",
+    "aten::normal_ / uniform_ (host RNG, uploaded)",
     "aten::_local_scalar_dense (Tensor.item, float(t))",
     # views (metadata; non-contiguous views are rejected by compute ops)
     "aten::view, aten::flatten, aten::reshape",
@@ -159,25 +181,41 @@ SUPPORTED_OPS = (
     "aten::mm",
     "aten::matmul (2-D x 2-D)",
     "aten::linear (F.linear / nn.Linear; x @ W^T + bias, all on the QPU)",
-    # conv / pool
-    "aten::convolution_overrideable (conv2d: 3x3/1x1, stride 1/2, pad, "
-    "groups=1 and depthwise, batch 1)",
-    "aten::max_pool2d (2x2/2 engine kernel, any NxN/stride/pad generic)",
-    "aten::_adaptive_avg_pool2d (any output size, GEMM reduction)",
-    "aten::upsample_nearest2d (nearest, any scale)",
-    # elementwise / reductions
-    "aten::add.Tensor (same shape, alpha=1)",
-    "aten::mul.Tensor (same shape)",
-    "aten::sub.Tensor / sub.Scalar",
+    # conv / pool (batch > 1, stride 1/2, 1x1/3x3, depthwise)
+    "aten::convolution_overrideable (conv2d, any batch, stride 1/2, "
+    "pad, groups=1 and depthwise)",
+    "aten::max_pool2d (2x2/2 engine kernel, any NxN/stride/pad generic, "
+    "any batch)",
+    "aten::_adaptive_avg_pool2d (any output size, GEMM reduction, any batch)",
+    "aten::upsample_nearest2d (nearest, any scale, any batch)",
+    # elementwise / unary (verified engine bodies)
+    "aten::add.Tensor / sub.Tensor / mul.Tensor / div.Tensor "
+    "(N-D broadcasting, per-channel, scalars)",
     "aten::add.Scalar, mul.Scalar, div.Scalar, neg, pow.Tensor_Scalar(2)",
     "aten::relu, silu, sigmoid",
-    "aten::_softmax (last dim, <= 16 classes)",
-    "aten::sum (full reduction), aten::mean",
-    "aten::cat (channel axis)",
-    "aten::native_batch_norm / batch_norm (inference mode only)",
+    "aten::abs, sign, clip, leaky_relu, hardsigmoid, hardswish",
+    "aten::tanh, sqrt, reciprocal (device composites: sigmoid / rsqrt)",
+    "aten::gelu(approximate='tanh') (device composite)",
+    # reductions over arbitrary dims
+    "aten::sum / mean (full and dim, keepdim)",
+    "aten::amax / amin (full and dim, keepdim; forward only)",
+    "aten::max / min / max.dim / min.dim (forward only)",
+    "aten::argmax / argmin (full and dim; host integer scan)",
+    # indexing
+    "aten::gather, aten::index_select (host word gather; forward only)",
+    "aten::scatter/sort/topk and friends raise with the precise reason",
+    # softmax
+    "aten::_softmax (any dim, any class count: engine <=16, two-pass above)",
+    # shape / norm
+    "aten::cat (channel axis, any batch)",
+    "aten::native_batch_norm / batch_norm (eval and training mode)",
     # autograd
-    "autograd for mm/matmul, linear, add, sub, mul, scalar ops, relu, silu, "
-    "sigmoid, softmax, conv2d, max_pool2d, view/as_strided(contiguous)",
+    "autograd for mm/matmul, linear, broadcast add/sub/mul/div, scalar ops, "
+    "relu, silu, sigmoid, abs, sign, clip, leaky_relu, hardsigmoid, "
+    "hardswish, tanh, sqrt, reciprocal, gelu(tanh), softmax, conv2d, "
+    "max_pool2d, adaptive_avg_pool2d, batch_norm (train+eval), sum/mean "
+    "(full and dim), view/as_strided(contiguous); amax/amin, gather and "
+    "scatter-like backwards raise with the precise reason",
 )
 
 __all__ = [

@@ -42,6 +42,10 @@ def expect_raise(name, fn, needle="not implemented for device vc4"):
     check(name, False, f"did NOT raise, returned {type(r)}")
 
 
+def torch_vc4_t(like, cpu_t):
+    return cpu_t.to(like.device)
+
+
 def main():
     print(f"torch {torch.__version__}  python {sys.version.split()[0]}")
     import torch_vc4
@@ -136,12 +140,14 @@ def main():
 
     # ------------------------------------------------- strict failure, no CPU
     expect_raise("torch.sin(vc4) raises", lambda: torch.sin(x))
-    expect_raise("torch.sum(dim=) raises (no reduction over a dim)",
-                 lambda: torch.sum(x, dim=1))
-    expect_raise("broadcasting add raises",
-                 lambda: x + torch.empty(256, 1,
-                                         device=torch_vc4.device()),
-                 needle="identical shapes")
+    xc2 = x.cpu()
+    check("sum over a dim == CPU",
+          bool(torch.allclose(torch.sum(x, dim=1).cpu(),
+                              torch.sum(xc2, dim=1), rtol=1e-4, atol=1e-4)))
+    bc = torch.randn(256, 1)
+    check("broadcasting add == CPU",
+          bool(torch.allclose((x + torch_vc4_t(x, bc)).cpu(), xc2 + bc,
+                              rtol=1e-6, atol=1e-6)))
     # views are metadata-only: a dim-0 slice is contiguous and usable ...
     check("dim-0 slice is a contiguous view",
           bool(x[0:2].is_contiguous() and tuple(x[0:2].shape) == (2, 256)),
@@ -153,7 +159,7 @@ def main():
     expect_raise("float64 on vc4 raises",
                  lambda: torch.empty(4, 4, dtype=torch.float64,
                                      device=torch_vc4.device()),
-                 needle="only float32")
+                 needle="unsupported by design")
     expect_raise("mm cpu x vc4 raises",
                  lambda: torch.mm(torch.randn(4, 4),
                                   torch.randn(4, 4,

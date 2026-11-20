@@ -83,7 +83,7 @@ def main():
           torch.zeros((5, 6)), exact=True)
 
     # ------------------------------------------------------------------ conv
-    print("\n--- conv2d (NCHW, batch 1) ---")
+    print("\n--- conv2d (NCHW, batch 1 and batched) ---")
     conv_cases = [
         # Cin, Cout, H, W, k, stride, pad, groups
         (3, 5, 8, 8, 3, 1, 1, 1),
@@ -206,26 +206,31 @@ def main():
     vx = U(x)
     raises("torch.sin(vc4)", lambda: torch.sin(vx), "not implemented")
     raises("torch.sort(vc4)", lambda: torch.sort(vx))
-    raises("torch.max(vc4) reduction", lambda: torch.max(vx[0]),
-           "not implemented")
+    check("torch.max(vc4) reduction", torch.max(vx[0]), torch.max(x[0]),
+          atol=2e-5)
     raises("conv2d dilation 2",
            lambda: F.conv2d(vx, U(torch.randn(4, 4, 3, 3)), None,
                             padding=2, dilation=2), "not implemented")
-    raises("conv2d batch 2",
-           lambda: F.conv2d(U(torch.randn(2, 4, 8, 8)),
-                            U(torch.randn(4, 4, 3, 3)), None, padding=1),
-           "batch size 1")
+    xb = torch.randn(2, 4, 8, 8)
+    wb = torch.randn(4, 4, 3, 3)
+    check("conv2d batch 2",
+          F.conv2d(U(xb), U(wb), None, padding=1),
+          F.conv2d(xb, wb, None, padding=1), atol=5e-4)
     raises("conv2d 5x5",
            lambda: F.conv2d(vx, U(torch.randn(4, 4, 5, 5)), None, padding=2),
            "1x1 and 3x3")
-    raises("softmax 32 classes",
-           lambda: F.softmax(U(torch.randn(4, 32)), -1), "at most 16")
+    xs = torch.randn(4, 32)
+    check("softmax 32 classes (two-pass)",
+          F.softmax(U(xs), -1), F.softmax(xs, -1), atol=5e-6)
     raises("max_pool2d ceil_mode",
            lambda: F.max_pool2d(vx, 3, 2, 1, ceil_mode=True), "ceil_mode")
-    raises("batch_norm training mode",
-           lambda: F.batch_norm(vx, U(torch.zeros(4)), U(torch.ones(4)),
-                                U(torch.zeros(4)), U(torch.ones(4)), True,
-                                0.1, 1e-5), "inference mode")
+    xb = torch.randn(2, 4, 8, 8)
+    yb = F.batch_norm(U(xb), U(torch.zeros(4)), U(torch.ones(4)),
+                      U(torch.ones(4)), U(torch.zeros(4)), True, 0.1, 1e-5)
+    check("batch_norm training mode",
+          yb, F.batch_norm(xb, torch.zeros(4), torch.ones(4),
+                           torch.ones(4), torch.zeros(4), True, 0.1, 1e-5),
+          atol=5e-5)
     raises("float64 on vc4",
            lambda: torch.zeros(4, dtype=torch.float64, device=D), "float32")
     raises("mm cpu x vc4", lambda: torch.mm(torch.randn(4, 4), U(
