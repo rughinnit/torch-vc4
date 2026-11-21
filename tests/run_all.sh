@@ -43,6 +43,16 @@ run() {
 }
 
 fails=0
+# Device-free checks: registration, broadcast and reduction plans, the GELU
+# derivative.  No vc4 context is opened, so this runs before the restarts.
+cpu_log="${TMPDIR:-/tmp}/torch_vc4_cpu.log"
+if "$PY" tests/test_cpu_registration.py >"$cpu_log" 2>&1; then
+    echo "=== cpu: PASS"
+else
+    echo "=== cpu: FAIL (see $cpu_log)"
+    tail -25 "$cpu_log"
+    fails=$((fails + 1))
+fi
 run ops tests/test_ops.py || fails=$((fails + 1))
 run complete tests/test_complete.py || fails=$((fails + 1))
 run autograd tests/test_autograd.py || fails=$((fails + 1))

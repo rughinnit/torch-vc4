@@ -241,13 +241,27 @@ def main():
         check("gelu tanh %s" % (sh,),
               F.gelu(U(x), approximate="tanh"),
               F.gelu(x, approximate="tanh"), atol=2e-5)
-    for name, fn in (("exp", torch.exp), ("log", torch.log),
-                     ("erf", torch.erf), ("floor", torch.floor),
-                     ("ceil", torch.ceil), ("round", torch.round)):
-        raises("%s raises with the op name" % name,
-               lambda fn=fn: fn(U(torch.randn(4))), name)
-    raises("gelu exact (erf) raises", lambda: F.gelu(
-        U(torch.randn(4)), approximate="none"), "gelu")
+        check("gelu exact %s" % (sh,),
+              F.gelu(U(x), approximate="none"),
+              F.gelu(x, approximate="none"), atol=2e-6)
+        check("exp %s" % (sh,), torch.exp(U(x)), torch.exp(x))
+        check("log %s" % (sh,), torch.log(U(xs)), torch.log(xs), atol=1e-6)
+        check("erf %s" % (sh,), torch.erf(U(x)), torch.erf(x), atol=2e-6)
+        check("floor %s" % (sh,), torch.floor(U(x)), torch.floor(x),
+              exact=True)
+        check("ceil %s" % (sh,), torch.ceil(U(x)), torch.ceil(x), exact=True)
+        check("round %s" % (sh,), torch.round(U(x)), torch.round(x),
+              exact=True)
+    # +-inf pass-through is measured separately (COMPLETENESS.md); the
+    # error metric would print inf - inf as NaN here.
+    edge = torch.tensor([1e10, -1e10, 8388608.0, -8388608.0, 0.0, -0.0])
+    check("floor large/signed zero", torch.floor(U(edge)), torch.floor(edge),
+          exact=True)
+    check("ceil large/signed zero", torch.ceil(U(edge)), torch.ceil(edge),
+          exact=True)
+    ties = torch.tensor([0.5, -0.5, 1.5, -1.5, 2.5, -2.5])
+    check("round ties to even", torch.round(U(ties)), torch.round(ties),
+          exact=True)
 
     # ------------------------------------------------------- 5. indexing
     print("\n=== 5. indexing ===")
@@ -322,6 +336,8 @@ def main():
     parity("reciprocal", lambda x: torch.reciprocal(x),
            [torch.rand(3, 4) + 0.5])
     parity("gelu tanh", lambda x: F.gelu(x, approximate="tanh"),
+           [torch.randn(3, 4)])
+    parity("gelu exact", lambda x: F.gelu(x, approximate="none"),
            [torch.randn(3, 4)])
 
     # batch-norm training gradients (input, gamma, beta), separate running
