@@ -194,8 +194,10 @@ SUPPORTED_OPS = (
     "aten::add.Scalar, mul.Scalar, div.Scalar, neg, pow.Tensor_Scalar(2)",
     "aten::relu, silu, sigmoid",
     "aten::abs, sign, clip, leaky_relu, hardsigmoid, hardswish",
+    "aten::floor, ceil, round (exact; engine-body unaries)",
+    "aten::exp, log, erf (engine-body unaries)",
     "aten::tanh, sqrt, reciprocal (device composites: sigmoid / rsqrt)",
-    "aten::gelu(approximate='tanh') (device composite)",
+    "aten::gelu(approximate='none' | 'tanh') (erf body / device composite)",
     # reductions over arbitrary dims
     "aten::sum / mean (full and dim, keepdim)",
     "aten::amax / amin (full and dim, keepdim; forward only)",
@@ -212,7 +214,7 @@ SUPPORTED_OPS = (
     # autograd
     "autograd for mm/matmul, linear, broadcast add/sub/mul/div, scalar ops, "
     "relu, silu, sigmoid, abs, sign, clip, leaky_relu, hardsigmoid, "
-    "hardswish, tanh, sqrt, reciprocal, gelu(tanh), softmax, conv2d, "
+    "hardswish, tanh, sqrt, reciprocal, gelu, softmax, conv2d, "
     "max_pool2d, adaptive_avg_pool2d, batch_norm (train+eval), sum/mean "
     "(full and dim), view/as_strided(contiguous); amax/amin, gather and "
     "scatter-like backwards raise with the precise reason",
