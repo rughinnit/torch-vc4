@@ -43,7 +43,9 @@ numerical contract, not because it beats a 1.2 GHz Cortex-A53.
 
 Sizes are the three listed per row.  Accuracy is the worst over the three
 shapes in `tests/completeness.py`; `tests/test_complete.py` independently
-checks the same ops (204 checks, all passing).
+checks the same ops (222 checks, all passing); `tests/test_cpu_registration.py`
+adds 46 device-free checks for registration, the broadcast and reduction
+plans, and the exact-GELU derivative.
 
 | aten op | backend | max abs / max rel | vc4 ms (3 sizes) | CPU ms (3 sizes) |
 |---|---|---|---|---|
@@ -77,6 +79,49 @@ launches, so a 32 Ki-element BN costs ~126 launches (~12 ms of GPU kernel
 time, the rest is round-trip latency).  A fused device BN kernel would fix
 this; it is on the engine's side, not hidden here.
 
+## Newly routed unary bodies (measured 2026-11-21)
+
+These six aten entries used to raise.  The engine's bodies were reworked and
+element-verified on 2026-11-20 (`vc4-stack` `docs/ONNX.md` §12.3: 0
+mismatches over 105,264 elements / 120 runs); this backend now routes them
+and the numbers below are the aten calls re-measured through `vc4d` on the
+same protocol as the main table.
+
+| aten op | backend | max abs / max rel | vc4 ms (64/4096/65536) | CPU ms (same sizes) |
+|---|---|---|---|---|
+| `aten::floor` | device | 0 / 0 (exact) | 0.258 / 0.421 / 3.399 | 0.0170 / 0.0292 / 0.1528 |
+| `aten::ceil` | device | 0 / 0 (exact) | 0.263 / 0.416 / 3.373 | 0.0162 / 0.0299 / 0.1537 |
+| `aten::round` | device | 0 / 0 (exact) | 0.259 / 1.046 / 12.658 | 0.0168 / 0.0298 / 0.1505 |
+| `aten::exp` | device | 1.15e-02 / 3.96e-06 | 0.254 / 1.025 / 12.690 | 0.0179 / 0.0729 / 0.4689 |
+| `aten::log` | device | 1.91e-06 / 2.08e-07 | 0.253 / 1.022 / 12.854 | 0.0178 / 0.0806 / 0.5271 |
+| `aten::erf` | device | 1.43e-06 / 1.43e-06 | 0.254 / 1.029 / 12.732 | 0.0167 / 0.0635 / 0.4024 |
+| `gelu(approximate='none')` | composite (erf) | 6.56e-07 / 6.56e-07 | 1.323 / 2.989 / 30.338 | 0.1104 / 0.1292 / 0.5938 |
+
+`floor`/`ceil`/`round` are exact over the finite range tested (±3e7 and
+±1e7, so both sides of the |x| >= 2^23 pass-through), and pass `±inf` and
+`NaN` through unchanged (measured: `floor(inf) = inf`, `floor(nan) = nan`).
+`round(2.5) = 2` (ties to even).
+
+Two domain limits are measured and stated rather than hidden:
+
+* `exp` flushes a denormal result to the smallest normal: `exp(-100)` returns
+  2^-126 = 1.175e-38 where the CPU returns 3.78e-44.  Finite overflow is
+  correct (`exp(100) = inf` on both).
+* `log` is measured for `x > 0`.  The body clamps the argument at 2^-126, so
+  `log(0)` and `log(-1)` return about -87.34 instead of `-inf`/`NaN`.
+
+The exact GELU gradient (composed from the erf and exp bodies) was checked
+against CPU autograd at 4096 elements: forward 5.96e-07 abs, gradient
+1.43e-06 abs / 1.43e-06 rel.
+
+The broadcast and dim-reduction paths were re-verified on the same pass.
+Broadcast `add` matched the CPU to 4.77e-07 abs for scalar, trailing, leading
+and middle broadcast (`(64,)+()`, `(8,8)+(8,)`, `(2,1)+(1,3)`,
+`(2,1,4)+(3,1)`).  `sum`/`mean` over one dim and over two dims, 2-D and 3-D,
+with and without keepdim, matched to 2.04e-04 abs (sum, 3-D) and 2.6e-06 abs
+(mean); a 512-element reduced axis reached 8.3e-04 abs for `sum`, the same
+truncating-accumulation floor the main table records.
+
 ## The rest of the intercepted surface (verified; same backend pattern)
 
 These share the rows above (one launch for a native unary body, a handful for
@@ -91,7 +136,7 @@ the table stays readable.
 | `aten::hardsigmoid` | device | 5.96e-08 / 5.96e-08 |
 | `aten::hardswish` | device | 2.38e-07 / 1.80e-07 |
 | `aten::reciprocal` | composite (rsqrt) | 1.91e-06 / 1.70e-07 |
-| `aten::gelu(approximate='tanh')` | composite (sigmoid) | 4.77e-07 / 3.13e-07 |
+| `aten::gelu` (both forms) | composite (sigmoid for 'tanh', erf for 'none') | 4.77e-07 / 3.13e-07 ('tanh'); 6.56e-07 / 6.56e-07 ('none') |
 | `aten::sum` / `mean` full and dim, keepdim | composite (GEMM) | 1.6e-05 abs / 1.9e-06 rel |
 | `aten::amin`, `aten::min`, `aten::max` | composite (relu tree) | 7.15e-07 / 3.05e-07 |
 | `aten::argmin`, `aten::argmax` (full/dim) | composite (host scan) | exact |
@@ -109,11 +154,6 @@ the table stays readable.
 
 | op | reason |
 |---|---|
-| `aten::exp` | The engine's `vc4_unary` exp body is **wrong on this board**: `genops_probe.py exp` measured max abs 2.5e5 / max rel 85 over 4096 inputs (4096/4096 outside tolerance).  Softmax does not need it (see below). |
-| `aten::log` | The engine's log body returns NaN for 4081/4096 inputs (measured). |
-| `aten::erf` | The engine's erf body does not generate / is numerically wrong in this kops build (`VC4_ERR_KERNEL`); `gelu(approximate='tanh')` is the available form. |
-| `aten::floor`, `aten::ceil` | The kernel does not generate in this kgen build (`kops.py b_ceil/b_floor` raises a Python `TypeError`, then `VC4_ERR_KERNEL`). |
-| `aten::round` | The engine body is wrong: max abs 12 / max rel 8.01, 3997/4096 inputs outside tolerance (measured). |
 | `aten::scatter*` | No device scatter kernel.  The table-driven `vc4_gather` only reads, and the engine's reduce/gather slice is not element-verified; a host scatter would be a CPU fallback. |
 | `aten::sort`, `aten::topk`, `aten::kthvalue`, `aten::median`, `aten::unique*` | No QPU sort/selection kernel; a host sort would be a full CPU fallback. |
 | `amax`/`amin` **backward**, `gather`/`index_select` **backward** | Their gradients need an additive scatter (equality mask for ties); no such kernel exists.  Forward is supported. |
@@ -143,11 +183,14 @@ the table stays readable.
   `vc4_depthwise_nhwc` for 3x3/stride-1/pad-1 depthwise (that kernel has no
   bias argument, so the bias is added on the QPU after the conv); other
   depthwise cases use the exact block-diagonal decomposition.
-* **The transcendental unary bodies are wrong** even though the verified subset
-  (`abs`, `neg`, `sign`, `clip` params, `leakyrelu`, `hardsigmoid`,
-  `hardswish`) is exact.  The backend routes only the verified set and
-  composes `tanh`/`sqrt`/`reciprocal` from `vc4_sigmoid`/`vc4_rsqrt`, which are
-  verified (batch norm has used them since 0.1.0).
+* **The transcendental unary bodies were wrong in the engine build this
+  backend first measured; that is fixed.**  `vc4-stack` reworked the bodies
+  and element-verified the whole family on 2026-11-20 (`docs/ONNX.md` §12.3),
+  and this backend now routes `exp`, `log`, `erf`, `floor`, `ceil` and
+  `round` natively (numbers above).  `tanh`/`sqrt`/`reciprocal` keep the
+  earlier composites built from `vc4_sigmoid`/`vc4_rsqrt`, which are verified
+  (batch norm has used them since 0.1.0); `gelu(approximate='none')` composes
+  the erf body.
 * **vc4d's launch policy rejects uniform words that alias the GPU bus
   window.**  A float with |v| >= 2 and a negative sign (including -inf) has
   that bit pattern, so `clip` is composed from `relu` + host-materialised
@@ -170,9 +213,27 @@ the signed `vc4-apt` repository:
 ## Reproduce
 
 ```sh
+.venv/bin/python tests/test_cpu_registration.py  # device-free: 46 checks
 .venv/bin/python tests/test_complete.py   # this table's accuracy checks
 .venv/bin/python tests/completeness.py    # this table's timings
-sh tests/run_all.sh                       # all four suites
+sh tests/run_all.sh                       # all five suites
 # against an installed wheel (a clean venv):
 PYTHON=/path/to/cleanvenv/bin/python sh tests/run_all.sh
+```
+
+The unary rows above were measured with the worktree engine and kgen:
+
+```sh
+cd ~/work/vc4-kops && make -C infer -j2
+cd ~/work/torch-vc4-gaps
+export PYTHONPATH=$PWD TMPDIR=$HOME/scratch/tmp VC4INFER_DAEMON=1
+export VC4INFER_KGEN=$PWD/../vc4-kops/infer/tools/kgen.py
+export ASM3_DIR=$PWD/../vc4-kops/infer/tools
+tools=../vc4-kops/tools/thermal-guard.sh
+$tools --interval 10 --max 71 -- ../torch-vc4/.venv/bin/python \
+    tests/test_cpu_registration.py
+$tools --interval 10 --max 71 -- ../torch-vc4/.venv/bin/python \
+    tests/test_ops.py
+$tools --interval 10 --max 71 -- ../torch-vc4/.venv/bin/python \
+    tests/test_autograd.py
 ```
