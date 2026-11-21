@@ -5,6 +5,12 @@
 > [`rughinnit/vc4-stack`](https://github.com/rughinnit/vc4-stack); see
 > `docs/ECOSYSTEM.md` there for how the repositories fit together.
 
+> **The source now lives in the main repository**, under
+> [`vc4-stack/torch/`](https://github.com/rughinnit/vc4-stack/tree/main/torch):
+> the backend, its tests and its `COMPLETENESS.md` are maintained there.
+> This repository is kept as the origin of the published `torch_vc4` 0.3.0
+> wheel and is read-only.
+
 
 Status: **feature-complete for the model families it declares** (version
 0.3.0). `torch_vc4.device()` is a real PyTorch device (`PrivateUse1`,
