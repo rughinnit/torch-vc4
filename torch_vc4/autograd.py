@@ -8,7 +8,8 @@ engine's own backward kernels:
   add/mul/sub/div  the engine's elementwise kernels; broadcast gradients are
                summed back to the input shape with the GEMM reduction
   relu         vc4_relu_backward (masked copy)
-  silu/sigmoid/tanh/sqrt/gelu(tanh)  composites of vc4_sigmoid / MUL / ADD
+  silu/sigmoid/tanh/sqrt/gelu  composites of vc4_sigmoid / MUL / ADD
+               (the exact GELU uses the erf and exp bodies)
   conv2d       vc4_conv2d_backward (im2col -> gemm3 -> col2im, dW and dX)
   max_pool2d   vc4_maxpool2x2_backward (argmax mask)
   softmax      y * (g - sum(g*y)) with the reduction as a GEMM
@@ -473,6 +474,31 @@ class GeluTanhFn(torch.autograd.Function):
             ds = T.mul(T.mul(s, T.add_scalar(T.mul_scalar(s, -1.0), 1.0)), du)
             factor = T.add(s, T.mul(x, ds))
             return T.mul(g, factor)
+        return _below(f)
+
+
+class GeluErfFn(torch.autograd.Function):
+    """Exact GELU.  The derivative is composed from the verified erf and exp
+    bodies: 0.5(1+erf(x/sqrt2)) + x*exp(-x^2/2)/sqrt(2*pi)."""
+
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)
+        return _below(lambda: ops.gelu(x, "none"))
+
+    @staticmethod
+    def backward(ctx, g):
+        g = _g(g)
+        (x,) = ctx.saved_tensors
+        import math
+
+        def f():
+            z = T.mul_scalar(x, 1.0 / math.sqrt(2.0))
+            cdf = T.mul_scalar(T.add_scalar(ops.unary_erf(z), 1.0), 0.5)
+            e = ops.unary_exp(T.mul_scalar(T.mul(x, x), -0.5))
+            pdf = T.mul_scalar(e, 1.0 / math.sqrt(2.0 * math.pi))
+            return T.mul(g, T.add(cdf, T.mul(x, pdf)))
+
         return _below(f)
 
 
@@ -956,8 +982,10 @@ def register():
     lib.impl("hardswish", lambda x: HardSwishFn.apply(x))
 
     def gelu(x, approximate="none"):
+        if approximate == "none":
+            return GeluErfFn.apply(x)
         if approximate != "tanh":
-            ops.gelu(x, approximate)      # raises with the precise reason
+            return ops.gelu(x, approximate)  # raises with the precise reason
         return GeluTanhFn.apply(x)
 
     lib.impl("gelu", gelu)

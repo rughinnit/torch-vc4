@@ -206,6 +206,64 @@ def main():
                 torch.abs(xv), torch.abs(x))
     row("aten::abs", "device", [64, 4096, 65536], b_abs)
 
+    def b_floor(sh):
+        n = sh
+        x = torch.randn(n) * 3e7
+        xv = U(x)
+        return (lambda: torch.floor(xv), lambda: torch.floor(x),
+                torch.floor(xv), torch.floor(x))
+    row("aten::floor", "device", [64, 4096, 65536], b_floor)
+
+    def b_ceil(sh):
+        n = sh
+        x = torch.randn(n) * 3e7
+        xv = U(x)
+        return (lambda: torch.ceil(xv), lambda: torch.ceil(x),
+                torch.ceil(xv), torch.ceil(x))
+    row("aten::ceil", "device", [64, 4096, 65536], b_ceil)
+
+    def b_round(sh):
+        n = sh
+        x = torch.randn(n) * 1e7
+        xv = U(x)
+        return (lambda: torch.round(xv), lambda: torch.round(x),
+                torch.round(xv), torch.round(x))
+    row("aten::round", "device", [64, 4096, 65536], b_round)
+
+    def b_exp(sh):
+        n = sh
+        x = torch.randn(n) * 4.0
+        xv = U(x)
+        return (lambda: torch.exp(xv), lambda: torch.exp(x),
+                torch.exp(xv), torch.exp(x))
+    row("aten::exp", "device", [64, 4096, 65536], b_exp)
+
+    def b_log(sh):
+        n = sh
+        x = torch.rand(n) * 1e4 + 1e-6
+        xv = U(x)
+        return (lambda: torch.log(xv), lambda: torch.log(x),
+                torch.log(xv), torch.log(x))
+    row("aten::log", "device", [64, 4096, 65536], b_log)
+
+    def b_erf(sh):
+        n = sh
+        x = torch.randn(n) * 2.0
+        xv = U(x)
+        return (lambda: torch.erf(xv), lambda: torch.erf(x),
+                torch.erf(xv), torch.erf(x))
+    row("aten::erf", "device", [64, 4096, 65536], b_erf)
+
+    def b_gelu0(sh):
+        n = sh
+        x = torch.randn(n) * 2.0
+        xv = U(x)
+        return (lambda: F.gelu(xv, approximate="none"),
+                lambda: F.gelu(x, approximate="none"),
+                F.gelu(xv, approximate="none"), F.gelu(x, approximate="none"))
+    row("gelu(approximate='none')", "composite (erf)",
+        [64, 4096, 65536], b_gelu0)
+
     def b_tanh(sh):
         n = sh
         x = torch.randn(n)

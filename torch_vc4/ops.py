@@ -107,22 +107,23 @@ def _permute_dims(t, order):
     return T.materialize(v)
 
 
-def _expand(t, shape):
-    """Right-aligned broadcast by materialising a 0-stride view.
+def _broadcast_view(shape, tshape, tstrides):
+    """Plan a right-aligned broadcast: ``(sizes, strides)`` or ``None``.
 
-    The arithmetic on the result is on the QPU; this is a byte replication
-    (the same class of work as contiguous()), not a compute fallback.
+    Pure shape arithmetic, split out so the broadcast rule is testable
+    without a device.  A size-1 axis takes a stride of 0; the caller then
+    materialises that view, which is a byte replication, not arithmetic.
     """
     shape = tuple(int(s) for s in shape)
-    if tuple(t.shape) == shape:
-        return t
-    f32(t, "broadcast")
-    lead = len(shape) - t.dim()
+    tshape = tuple(int(s) for s in tshape)
+    if tshape == shape:
+        return None
+    lead = len(shape) - len(tshape)
     if lead < 0:
         raise RuntimeError("torch_vc4: cannot broadcast %s to %s"
-                           % (tuple(t.shape), shape))
-    sizes = (1,) * lead + tuple(t.shape)
-    strides = (0,) * lead + tuple(t.stride()) if t.dim() else (0,) * lead
+                           % (tshape, shape))
+    sizes = (1,) * lead + tshape
+    strides = (0,) * lead + tuple(int(s) for s in tstrides)
     ns, nst = [], []
     for s, o, st in zip(sizes, shape, strides):
         if s == o:
@@ -134,7 +135,24 @@ def _expand(t, shape):
         else:
             raise RuntimeError(
                 "torch_vc4: cannot broadcast %s to %s (dim %d: %d vs %d)"
-                % (tuple(t.shape), shape, len(ns), s, o))
+                % (tshape, shape, len(ns), s, o))
+    return ns, nst
+
+
+def _expand(t, shape):
+    """Right-aligned broadcast by materialising a 0-stride view.
+
+    The arithmetic on the result is on the QPU; this is a byte replication
+    (the same class of work as contiguous()), not a compute fallback.
+    """
+    shape = tuple(int(s) for s in shape)
+    if tuple(t.shape) == shape:
+        return t
+    f32(t, "broadcast")
+    plan = _broadcast_view(shape, t.shape, t.stride())
+    if plan is None:
+        return t
+    ns, nst = plan
     v = T.as_strided_alias(t, ns, nst, t.storage_offset())
     return T.materialize(v)
 
@@ -205,22 +223,41 @@ def _min_last(x2):
     return T.mul_scalar(_max_last(T.mul_scalar(x2, -1.0)), -1.0)
 
 
+def _reduce_plan(shape, dims, keepdim):
+    """Plan a dim reduction: ``(order, kept, red, outer, out_shape)``.
+
+    Pure shape arithmetic.  ``order`` puts the reduced axes last so the
+    following gather materialises ``[outer][red]``; ``red`` is the product of
+    the reduced sizes and ``out_shape`` is the aten result shape.
+    """
+    shape = tuple(int(s) for s in shape)
+    nd = len(shape)
+    dims = _norm_dims(dims, nd)
+    keep = [i for i in range(nd) if i not in dims]
+    red = 1
+    for i in dims:
+        red *= shape[i]
+    total = 1
+    for s in shape:
+        total *= s
+    outer = total // red if red else 0
+    if keepdim:
+        out_shape = tuple(1 if i in dims else shape[i] for i in range(nd))
+    else:
+        out_shape = tuple(shape[i] for i in keep)
+    return keep + dims, tuple(shape[i] for i in keep), red, outer, out_shape
+
+
 def _dims_reduce(t, dims, keepdim, op):
     """Reduce ``t`` over ``dims`` (sum/mean/max/min) on the QPU.
 
     The tensor is permuted so the reduced dims are last (a byte gather), then
     flattened to [outer][red]: sums are one GEMM, max/min a relu tree.
     """
-    nd = t.dim()
-    dims = _norm_dims(dims, nd)
-    keep = [i for i in range(nd) if i not in dims]
-    order = keep + dims
+    dims = _norm_dims(dims, t.dim())
+    order, kept_shape, red, outer, out_shape = _reduce_plan(
+        t.shape, dims, keepdim)
     xp = _permute_dims(t, order)
-    kept_shape = tuple(t.shape[i] for i in keep)
-    red = 1
-    for i in dims:
-        red *= t.shape[i]
-    outer = t.numel() // red
     x2 = xp.view(outer, red)
     if op in ("sum", "mean"):
         r = _sum_last(x2)
@@ -233,10 +270,7 @@ def _dims_reduce(t, dims, keepdim, op):
     else:  # pragma: no cover
         raise RuntimeError("torch_vc4: unknown reduction %r" % (op,))
     if keepdim:
-        shape = [1] * nd
-        for k, i in enumerate(keep):
-            shape[i] = t.shape[i]
-        return r.view(shape)
+        return r.view(list(out_shape))
     return r.view(kept_shape)
 
 
@@ -648,14 +682,24 @@ def softmax(x, dim, half_to_float=False):
  UOP_TANH, UOP_ERF, UOP_ELU, UOP_SELU, UOP_SOFTPLUS, UOP_SOFTSIGN, UOP_GELU,
  UOP_GELU_ERF, UOP_HARDSIGMOID, UOP_HARDSWISH, UOP_SIN, UOP_COS) = range(25)
 
-# Unary ops whose QPU body this engine build measured correct on the board.
-# (genops_probe.py: abs/neg/sign/clip/leakyrelu/hardsigmoid/hardswish.)
+# Unary ops whose QPU body the engine element-verified on silicon.  The
+# evidence is vc4-stack docs/ONNX.md section 12.3 (2026-11-20): five shapes
+# per op, 0 mismatches over 105,264 elements / 120 runs, at
+# 1e-4 + 1e-4*max(|ref|,1).  It covers identity, abs, neg, sign, floor, ceil,
+# round, clip, leakyrelu, hardsigmoid, hardswish, exp, log, sqrt, reciprocal,
+# tanh, erf, softplus, softsign, elu, selu, gelu (tanh form), sin and cos.
+#
+# Only the ids with an aten entry point are routed here.  The gate stays so a
+# future body that has not been through that protocol cannot be reached by
+# accident; sqrt/reciprocal/tanh still use the older composites below, which
+# are verified through this backend's own tables.
 _VERIFIED_UOPS = {UOP_ABS, UOP_NEG, UOP_SIGN, UOP_CLIP, UOP_LEAKYRELU,
-                  UOP_HARDSIGMOID, UOP_HARDSWISH}
+                  UOP_HARDSIGMOID, UOP_HARDSWISH, UOP_FLOOR, UOP_CEIL,
+                  UOP_ROUND, UOP_EXP, UOP_LOG, UOP_ERF}
 
-_BROKEN = ("the engine's vc4_unary kernel for this op is present but returns "
-           "wrong numbers on this board (measured; see COMPLETENESS.md), so "
-           "it is not routed. No CPU fallback is used")
+_BROKEN = ("the engine's vc4_unary kernel for this op is present but has not "
+           "been element-verified on this board, so it is not routed. No CPU "
+           "fallback is used")
 
 
 def _uop(op, name, x, p0=0.0, p1=0.0, p2=0.0):
@@ -716,6 +760,52 @@ def unary_hardswish(x):
     return _uop(UOP_HARDSWISH, "hardswish", x, 1.0 / 6.0, 0.5)
 
 
+def unary_floor(x):
+    """floor: exact over the finite fp32 range.
+
+    |x| >= 2^23 is returned unchanged by the body, which is also why large
+    values no longer overflow the int32 conversion.  +-inf and NaN take the
+    same pass-through (measured: floor(inf) = inf, floor(nan) = nan).
+    """
+    return _uop(UOP_FLOOR, "floor", x)
+
+
+def unary_ceil(x):
+    """ceil: exact over the finite fp32 range (see unary_floor)."""
+    return _uop(UOP_CEIL, "ceil", x)
+
+
+def unary_round(x):
+    """round: nearest, ties to even, as aten::round defines it."""
+    return _uop(UOP_ROUND, "round", x)
+
+
+def unary_exp(x):
+    """exp: 2^(x*log2e) with an exact exponent scale.
+
+    Engine-measured worst case 5.7e-6 relative over [-88, 88].  Finite
+    inputs above ln(FLT_MAX) overflow to inf as the fp32 reference does;
+    a result that would be denormal is flushed to the smallest normal
+    (exp(-100) -> 2^-126).  NaN is not in the measured domain.
+    """
+    return _uop(UOP_EXP, "exp", x)
+
+
+def unary_log(x):
+    """log: exponent/mantissa split plus an atanh series.
+
+    Engine-measured worst case 4.8e-7 relative.  The measured domain is
+    x > 0; the body clamps the argument at 2^-126, so log(0) and negative
+    arguments are not the -inf/NaN the IEEE reference returns.
+    """
+    return _uop(UOP_LOG, "log", x)
+
+
+def unary_erf(x):
+    """erf: A&S 7.1.26 with the exp core, exact +-1 saturation past |x| = 4."""
+    return _uop(UOP_ERF, "erf", x)
+
+
 def sigmoid(x):
     f32(x, "sigmoid")
     return T.sigmoid(x)
@@ -753,19 +843,20 @@ def reciprocal(x):
 
 
 def gelu(x, approximate="none"):
-    """GELU.  Only the tanh approximation is available on the QPU.
+    """GELU in both aten forms.
 
-    x*sigmoid(2c(x + 0.044715 x^3)), c = sqrt(2/pi), which is exactly
-    0.5x(1+tanh(c(x+0.044715x^3))).  The exact erf form needs the engine's
-    erf body, which is wrong in this build.
+    approximate='tanh' is x*sigmoid(2c(x + 0.044715 x^3)), c = sqrt(2/pi),
+    a device composite.  approximate='none' is 0.5x(1+erf(x/sqrt(2))), which
+    uses the engine's element-verified erf body.
     """
     f32(x, "gelu")
-    if approximate not in ("tanh",):
-        _unavailable(
-            "gelu(approximate=%r)" % (approximate,),
-            "the exact erf form needs the engine's erf kernel, which returns "
-            "wrong numbers in this build (measured; COMPLETENESS.md).  Use "
-            "approximate='tanh' (device composite) instead")
+    if approximate not in ("none", "tanh"):
+        _unavailable("gelu(approximate=%r)" % (approximate,),
+                     "aten defines 'none' and 'tanh'; both are routed, "
+                     "anything else is not a GELU form")
+    if approximate == "none":
+        z = T.mul_scalar(x, 1.0 / math.sqrt(2.0))
+        return T.mul_scalar(T.mul(x, T.add_scalar(unary_erf(z), 1.0)), 0.5)
     c = math.sqrt(2.0 / math.pi)
     x3 = T.mul(x, T.mul(x, x))
     z = T.mul_scalar(T.add(x, T.mul_scalar(x3, 0.044715)), 2.0 * c)
@@ -776,40 +867,6 @@ def unary_raise(name, why):
     def f(x, *a, **k):
         _unavailable(name, why)
     return f
-
-
-def _exp_unavailable(x):
-    _unavailable("exp", "the engine's exp body is wrong on this board "
-                 "(measured max abs 2.5e5 vs CPU; COMPLETENESS.md); the "
-                 "verified device path is sigmoid-based, which only covers "
-                 "the non-positive range used inside softmax")
-
-
-def _log_unavailable(x):
-    _unavailable("log", "the engine's log body is wrong on this board "
-                 "(measured: NaN for 4081/4096 inputs; COMPLETENESS.md)")
-
-
-def _erf_unavailable(x):
-    _unavailable("erf", "the engine's erf body is wrong on this board "
-                 "(COMPLETENESS.md); gelu(approximate='tanh') is available")
-
-
-def _floor_unavailable(x):
-    _unavailable("floor", "the engine's floor kernel does not even generate "
-                 "in this kgen build (kops.py b_ceil/b_floor TypeError, then "
-                 "VC4_ERR_KERNEL); COMPLETENESS.md")
-
-
-def _ceil_unavailable(x):
-    _unavailable("ceil", "the engine's ceil kernel does not generate in this "
-                 "kgen build (kops.py b_ceil TypeError; VC4_ERR_KERNEL); "
-                 "COMPLETENESS.md")
-
-
-def _round_unavailable(x):
-    _unavailable("round", "the engine's round body is wrong on this board "
-                 "(measured max abs 12 vs CPU; COMPLETENESS.md)")
 
 
 # ------------------------------------------------------------ binary ops
@@ -1373,10 +1430,12 @@ def register():
     impl("hardswish", unary_hardswish)
     impl("gelu", gelu)
     impl("reciprocal", reciprocal)
-    for _n, _f in (("exp", _exp_unavailable), ("log", _log_unavailable),
-                   ("erf", _erf_unavailable), ("floor", _floor_unavailable),
-                   ("ceil", _ceil_unavailable), ("round", _round_unavailable)):
-        impl(_n, _f)
+    impl("exp", unary_exp)
+    impl("log", unary_log)
+    impl("erf", unary_erf)
+    impl("floor", unary_floor)
+    impl("ceil", unary_ceil)
+    impl("round", unary_round)
     # aten::view/aten::as_strided are registered natively (csrc) -- the
     # Python layer only supplies the autograd Functions for them.
     impl("flatten.using_ints", flatten)
