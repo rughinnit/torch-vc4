@@ -129,17 +129,17 @@ engine bindings in `csrc/torch_vc4.cpp`):
 | `contiguous`, `clone` | host strided gather | needed for autograd gradients that arrive as `expand`ed views |
 | `mm`, `matmul` | `vc4_matmul` → QPU pack + asm10 GEMM | f32, 2-D, contiguous |
 | `linear` | `mm_bt` (x @ W^T) + broadcast bias | 2-D or batched-2-D, f32 |
-| `convolution_overrideable`, `convolution_backward_overrideable` | `vc4_conv2d` (im2col + GEMM) / `vc4_conv2d_backward` (im2col_r + gemm3 + col2im) | NCHW, batch 1, f32; kernel 3x3 or 1x1; stride 1 or 2; symmetric `pad ≤ k/2`; `groups=1` or depthwise (multiplier 1); dilation 1; `(H+2p)·align16(W+2p)·4 ≤ 8191` |
+| `convolution_overrideable`, `convolution_backward_overrideable` | NCHW im2col+GEMM, or native NHWC for batch > 1 | f32; any batch; kernel 3x3 or 1x1; stride 1 or 2; symmetric `pad ≤ k/2`; `groups=1` or depthwise (multiplier 1); dilation 1; NCHW `(H+2p)·align16(W+2p)·4 ≤ 8191` |
 | `max_pool2d` | `vc4_maxpool2x2` (2x2/2) or `vc4_maxpooln` (any NxN/stride/pad) | square kernel/stride/pad, dilation 1, `ceil_mode=False`; 2x2 engine kernel needs `H%8==0, W%16==0` |
 | `_adaptive_avg_pool2d` | hosting-built averaging matrix + one QPU GEMM | any output size, batch 1 |
-| `_softmax` | `vc4_softmax_fwd` | **last dim only**, ≤ 16 classes (engine lane width) |
+| `_softmax` | `vc4_softmax_fwd` ≤ 16 classes, two-pass above | any dim, any class count |
 | `sigmoid`, `silu`, `relu` | `vc4_elementwise` / `vc4_sigmoid` / `vc4_silu` | f32, contiguous |
-| `add.Tensor`, `mul.Tensor`, `sub.Tensor` | `vc4_elementwise` ADD/MUL (+ `mul(-1)`) | identical shapes (no broadcast); a Python scalar / CPU 0-dim operand is accepted and becomes a GPU scalar op |
+| `add.Tensor`, `mul.Tensor`, `sub.Tensor` | `vc4_elementwise` ADD/MUL (+ `mul(-1)`) | N-D broadcasting (scalar, trailing, leading, middle) materialised as 0-stride copies, per-channel, scalars |
 | `add/mul/div/sub.Scalar`, `neg`, `pow.Tensor_Scalar(2)` | GPU scalar kernel with a host-materialised constant | — |
-| `sum`, `mean` | ones-vector GEMM, 4096-element chunks | full reduction only |
+| `sum`, `mean` | permute reduced axes last, then ones-vector GEMM | full and dim/dims, keepdim |
 | `cat` | host byte concat | channel axis of NCHW (or dim 0 of a 3-D tensor) |
 | `upsample_nearest2d` | host byte gather (PyTorch's nearest index rule) | nearest, any scale; not bilinear |
-| `native_batch_norm`, `batch_norm` | per-channel scale/shift as QPU elementwise ops | **inference mode only**; `fold_bn_into_conv()` folds BN into conv parameters offline |
+| `native_batch_norm`, `batch_norm` | per-channel scale/shift as QPU elementwise ops | eval and training mode; `fold_bn_into_conv()` folds BN into conv parameters offline |
 | `_local_scalar_dense` | download 1 element | `float(t)`, `t.item()` |
 | `normal_`, `uniform_` | host `std::mt19937`, uploaded | f32; the RNG is on the host (`uniform_` is what module constructors call) |
 | everything else | catch-all `PrivateUse1` fallback | raises `RuntimeError: torch_vc4: 'aten::…' is not implemented for device vc4` |
@@ -148,7 +148,9 @@ Autograd (`torch_vc4/autograd.py`, registered at `AutogradPrivateUse1`):
 `mm`/`matmul`, `linear`, `add`, `sub`, `mul`, scalar ops, `pow(2)`, `relu`,
 `silu`, `sigmoid`, `softmax`, `conv2d` (stride 1 and 2, depthwise),
 `max_pool2d` (2x2/2 only — the engine's argmax-mask kernel),
-`adaptive_avg_pool2d`, `sum`, `mean`, `view`/`as_strided` (contiguous only).
+`adaptive_avg_pool2d`, `sum`, `mean` (full and dim), `view`/`as_strided`
+(contiguous only), `gelu` (both forms), `tanh`, `sqrt`, `reciprocal`, `abs`,
+`sign`, `clip`, `leaky_relu`, `hardsigmoid`, `hardswish`.
 Backward kernels used: `vc4_matmul_bt`, `vc4_transpose` + `vc4_matmul`,
 `vc4_relu_backward`, `vc4_conv2d_backward`, `vc4_maxpool2x2_backward`,
 `vc4_sigmoid`/`vc4_elementwise` for the composed ones.
@@ -160,12 +162,12 @@ Backward kernels used: `vc4_matmul_bt`, `vc4_transpose` + `vc4_matmul`,
 `(a - b).pow(2).sum()` for the loss and a hand-written update
 (`p.copy_(p - lr * p.grad)`) instead of `torch.optim`.
 
-Deliberately absent, therefore raising: `sin`/`cos`/`exp`/`log`, `var`/`std`,
-`max`/`argmax` reductions, `topk`/`sort`, `bmm`, broadcasting, `div` of two
-device tensors (no reciprocal kernel), `conv3d`, `conv_transpose`, dilated
-convs, `ceil_mode` pooling, `nn.LSTM`, `torch.compile`, int64/float64
-tensors, batch > 1, `adaptive_max_pool2d`, bilinear resize, `softmax` over a
-non-last dim or > 16 classes, image `print()`/`repr()`.
+Deliberately absent, therefore raising: `sin`/`cos` (bodies exist but have
+no aten route here), `var`/`std`, `topk`/`sort`/`scatter`, `bmm`, `conv3d`,
+`conv_transpose`, dilated convs, grouped conv beyond depthwise, `ceil_mode`
+pooling, `nn.LSTM`, `torch.compile`, int64/float64 tensors, bilinear resize,
+autograd for `floor`/`ceil`/`round`/`exp`/`log`/`erf`, and image
+`print()`/`repr()`.  `COMPLETENESS.md` is the authoritative per-op table.
 
 ## Operational notes (measured, not folklore)
 
